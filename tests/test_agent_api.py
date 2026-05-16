@@ -219,10 +219,14 @@ def test_task_detail_returns_populated_workflow_dashboard(client, mock_live_rag_
         "memory_matches",
         "tool_calls",
         "approvals",
-        "generated_artifacts",
-        "graph_trace",
-        "final_report",
-    }
+            "generated_artifacts",
+            "graph_trace",
+            "mvp_plan",
+            "build_timeline",
+            "mvp_validation",
+            "mvp_delivery",
+            "final_report",
+        }
     assert data["build_context"]["requiredDeliverables"]
     assert data["runtime"] == "langgraph"
     assert data["registered_tools"] == []
@@ -267,10 +271,11 @@ def test_task_detail_returns_populated_workflow_dashboard(client, mock_live_rag_
         "exchange_github_code",
         "retrieve_context",
         "scope_mvp",
-        "plan_repo",
-        "create_repo",
-        "generate_files",
-        "commit_progress",
+            "plan_repo",
+            "create_repo",
+            "generate_files",
+            "validate_mvp",
+            "commit_progress",
         "verify_build",
         "handle_blocker",
         "verify_build",
@@ -289,7 +294,7 @@ def test_task_detail_returns_populated_workflow_dashboard(client, mock_live_rag_
         "blocker_analysis",
         "final_package",
     }
-    assert all(step["model_mode"] == "mock" for step in model_steps)
+    assert all(step["model_mode"] == "partial" for step in model_steps)
     assert "fake-nvidia-key" not in response.text
 
 

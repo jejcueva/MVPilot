@@ -48,7 +48,11 @@ def registered_tools_for_settings(settings: Settings) -> list[str]:
 
 
 class OpenClawToolAdapter:
-    """OpenClaw-compatible tool boundary around MVPilot's existing tool adapter."""
+    """OpenClaw-compatible tool boundary around MVPilot's existing tool adapter.
+
+    Pair with `agent.openclaw_orchestrator.OpenClawOrchestrator` for phased MVP build
+    telemetry; LangGraph nodes call the orchestrator while tools execute here.
+    """
 
     def __init__(self, wrapped: ToolAdapter, *, environment: str | None = None) -> None:
         self._wrapped = wrapped

@@ -166,6 +166,7 @@ async def test_full_workflow_completes_with_expected_timeline(mock_live_rag_sear
         "plan_repo",
         "create_repo",
         "generate_files",
+        "validate_mvp",
         "commit_progress",
         "verify_build",
         "handle_blocker",
@@ -185,7 +186,7 @@ async def test_full_workflow_completes_with_expected_timeline(mock_live_rag_sear
     assert detail.build_context.get("evidence")
     assert detail.memory_matches
     assert detail.final_report is not None
-    assert detail.final_report["mode"] == "mock"
+    assert detail.final_report["mode"] == "partial"
     assert {artifact["name"] for artifact in detail.generated_artifacts} >= {
         "README.md",
         "package.json",
@@ -215,7 +216,7 @@ async def test_full_workflow_completes_with_expected_timeline(mock_live_rag_sear
     assert model_backed_steps["scope_mvp"].model == settings.nemotron_model
     assert model_backed_steps["plan_repo"].model == settings.nemotron_model
     assert model_backed_steps["generate_files"].model == settings.nemotron_fast_model
-    assert all(step.model_mode == "mock" for step in model_backed_steps.values())
+    assert all(step.model_mode == "partial" for step in model_backed_steps.values())
     assert all(step.decision_trace for step in detail.agent_steps)
     assert detail.final_report["readme"]["content"]
     assert detail.final_report["demo_script"]["content"]

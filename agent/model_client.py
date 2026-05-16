@@ -23,7 +23,7 @@ from agent.model_outputs import (
 
 
 OutputT = TypeVar("OutputT", bound=BaseModel)
-ModelMode = Literal["mock", "live", "fallback"]
+ModelMode = Literal["mock", "live", "partial"]
 
 
 class ModelClientError(Exception):
@@ -103,11 +103,8 @@ class NemotronModelClient:
     def __init__(
         self,
         settings: Settings,
-        *,
-        fallback_client: DeterministicModelClient | None = None,
     ) -> None:
         self._settings = settings
-        self._fallback_client = fallback_client
 
     async def complete_structured(
         self,
@@ -120,7 +117,7 @@ class NemotronModelClient:
         reasoning_effort: str = "medium",
     ) -> ModelCallResult[OutputT]:
         if not self._settings.nvidia_configured:
-            return await self._fallback(
+            return await self._idea_specific_partial(
                 purpose=purpose,
                 model=model,
                 prompt=prompt,
@@ -152,7 +149,7 @@ class NemotronModelClient:
                 last_reason = exc.safe_message
                 if attempt + 1 < attempts:
                     continue
-                return await self._fallback(
+                return await self._idea_specific_partial(
                     purpose=purpose,
                     model=model,
                     prompt=prompt,
@@ -161,7 +158,7 @@ class NemotronModelClient:
                     started=started,
                 )
             except ModelClientError as exc:
-                return await self._fallback(
+                return await self._idea_specific_partial(
                     purpose=purpose,
                     model=model,
                     prompt=prompt,
@@ -173,7 +170,7 @@ class NemotronModelClient:
                 last_reason = "Nemotron request timed out."
                 if attempt + 1 < attempts:
                     continue
-                return await self._fallback(
+                return await self._idea_specific_partial(
                     purpose=purpose,
                     model=model,
                     prompt=prompt,
@@ -185,7 +182,7 @@ class NemotronModelClient:
                 last_reason = "Nemotron request failed."
                 if attempt + 1 < attempts:
                     continue
-                return await self._fallback(
+                return await self._idea_specific_partial(
                     purpose=purpose,
                     model=model,
                     prompt=prompt,
@@ -194,7 +191,7 @@ class NemotronModelClient:
                     started=started,
                 )
 
-        return await self._fallback(
+        return await self._idea_specific_partial(
             purpose=purpose,
             model=model,
             prompt=prompt,
@@ -319,7 +316,7 @@ class NemotronModelClient:
             latency_ms=_elapsed_ms(started),
         )
 
-    async def _fallback(
+    async def _idea_specific_partial(
         self,
         *,
         purpose: str,
@@ -329,11 +326,16 @@ class NemotronModelClient:
         reason: str,
         started: float | None = None,
     ) -> ModelCallResult[OutputT]:
-        fallback_client = self._fallback_client or DeterministicModelClient(
-            mode="fallback",
-            fallback_reason=reason,
-        )
-        result = await fallback_client.complete_structured(
+        if not self._settings.allow_idea_aware_partial:
+            raise ModelClientError(
+                f"Live Nemotron is required for MVP generation ({reason}). "
+                "Set NVIDIA_API_KEY or enable ALLOW_IDEA_AWARE_PARTIAL for graceful degradation."
+            )
+
+        from agent.idea_aware_partial import IdeaAwarePartialClient
+
+        partial_client = IdeaAwarePartialClient(partial_reason=reason)
+        result = await partial_client.complete_structured(
             purpose=purpose,
             model=model,
             prompt=prompt,
@@ -395,8 +397,9 @@ def _trace(
     fallback_reason: str | None,
     entries: list[str],
 ) -> list[str]:
-    if mode == "fallback":
-        return ["Fallback mode: NVIDIA endpoint unavailable.", *entries]
+    if mode == "partial":
+        prefix = f"Partial mode: {fallback_reason or 'live model unavailable; idea-specific scaffold used'}"
+        return [prefix, *entries]
     return entries
 
 
@@ -452,29 +455,38 @@ def _deterministic_payload(
         "blocker_analysis": _blocker_analysis_payload,
     }
     try:
-        return payloads[purpose](mode, fallback_reason, idea)
+        return payloads[purpose](mode, fallback_reason, idea, prompt)
     except KeyError as exc:
         raise ModelClientError(f"Unsupported model purpose: {purpose}.") from exc
 
 
-def _scope_payload(mode: ModelMode, fallback_reason: str | None, idea: str) -> dict:
+def _scope_payload(
+    mode: ModelMode,
+    fallback_reason: str | None,
+    idea: str,
+    prompt: str = "",
+) -> dict:
+    from agent.idea_context import extract_json_section, features_from_context, target_users_from_context
+
     label = _idea_label(idea)
+    intake = extract_json_section(prompt, "Frontend intake:\n")
+    features = features_from_context(idea=idea, intake=intake)
+    target = target_users_from_context(intake) or "users described in the submitted MVP"
     return MvpScopeOutput(
-        target_user="primary user for the submitted MVP",
-        must_have=[
-            "clear user intake",
-            "source-grounded MVP scope",
-            "visible progress and final package",
-        ],
-        demo_boundary=f"one mocked workflow for: {label}",
+        target_user=target,
+        must_have=features,
+        demo_boundary=(
+            f"one idea-specific workflow for: {label}; use live integrations where configured "
+            "and clearly labeled mocks where credentials are unavailable"
+        ),
         mode=mode,
         decision_trace=_trace(
             mode,
             fallback_reason,
             [
                 f"Grounded the scope in the submitted idea: {label}.",
-                "Kept the MVP to one visible workflow for a short hackathon demo.",
-                "Rejected broad integrations until the core demo path is reliable.",
+                "Kept the MVP to one visible workflow for a short hackathon run.",
+                "Deferred broad integrations only when the idea-specific core path needed credentials or more time.",
             ],
         ),
     ).model_dump()
@@ -492,10 +504,16 @@ def _repo_plan_payload(
     warning_summary = _source_warning_summary(prompt)
     files = [
         "README.md",
-        "requirements.txt",
-        "src/app.py",
-        "src/core/agent.py",
-        "tests/test_app.py",
+        "package.json",
+        "index.html",
+        "src/App.jsx",
+        "src/styles.css",
+        "src/data/mockRecords.js",
+        "backend/main.py",
+        "backend/mvp_engine.py",
+        "backend/requirements.txt",
+        "tests/test_backend.py",
+        "database/schema.sql",
         "docs/ARCHITECTURE.md",
         "docs/BUILD_LOG.md",
         "demo/demo_script.md",
@@ -507,15 +525,18 @@ def _repo_plan_payload(
         selected_stack=[item.strip() for item in resolved_stack.split(",") if item.strip()],
         repo_structure=[
             "README.md",
-            "src/ for application code",
+            "src/ for the React MVP experience",
+            "backend/ for FastAPI routes and idea-specific service logic",
+            "database/ for schema notes and seedable tables",
             "tests/ for smoke tests",
-            "docs/ for architecture and build logs",
-            "demo/ for the judging walkthrough",
+            "docs/ for architecture, build logs, and validation notes",
+            "demo/ for the walkthrough script",
         ],
         implementation_steps=[
-            "Create a minimal API entrypoint.",
-            "Add a deterministic agent core that mirrors the scoped MVP.",
-            "Document architecture, build evidence, and demo flow.",
+            "Create the idea-specific frontend workflow.",
+            "Generate backend/API routes that serve the scoped MVP state.",
+            "Add labeled mock integrations when live credentials are unavailable.",
+            "Document architecture, build evidence, validation, and setup.",
             "Commit generated files through the GitHub Agent.",
         ],
         agent_assignments=[
@@ -536,9 +557,9 @@ def _repo_plan_payload(
             "Keep GitHub and Supabase service credentials server-side.",
         ],
         demo_requirements=[
-            "Show the flight-stage progress path.",
-            "Show RAG evidence before plan generation.",
-            "End with GitHub repo and commit links.",
+            "Show the submitted idea becoming requirements, architecture, and files.",
+            "Show RAG evidence before plan generation when source context exists.",
+            "End with GitHub repo, commit links, and validation status.",
         ],
         test_plan=["unit workflow", "API integration", "repo health smoke check"],
         architecture_notes=[
@@ -668,7 +689,7 @@ def _file_manifest_payload(
             mode,
             fallback_reason,
             [
-                f"Mapped {title} into runnable frontend, backend, database, tests, docs, and demo artifacts.",
+                f"Mapped {title} into runnable frontend, backend, database, tests, docs, and walkthrough artifacts.",
                 f"Used resolved stack summary: {resolved_stack}.",
                 warning_summary or "No submitted source warnings were present.",
                 "Kept artifact content compact, commit-safe, and health-checkable.",
@@ -677,19 +698,25 @@ def _file_manifest_payload(
     ).model_dump()
 
 
-def _blocker_analysis_payload(mode: ModelMode, fallback_reason: str | None, idea: str) -> dict:
+def _blocker_analysis_payload(
+    mode: ModelMode,
+    fallback_reason: str | None,
+    idea: str,
+    prompt: str = "",
+) -> dict:
+    del prompt
     label = _idea_label(idea)
     return BlockerAnalysisOutput(
-        blocker_type="missing_demo_dependency",
+        blocker_type="repo_health_recovery",
         severity="medium",
         recoverable=True,
         root_cause=(
-            "The generated package references a demo dependency before the mock "
-            "build adapter has a matching stub."
+            "Repository health verification found a missing or incomplete generated artifact "
+            "after the idea-specific package was committed."
         ),
         recovery_plan=[
             "Classify the build result as recoverable.",
-            "Apply the deterministic dependency stub patch.",
+            "Regenerate or patch only the missing idea-specific artifact.",
             "Run build verification again before final packaging.",
         ],
         decision_trace=_trace(
@@ -719,15 +746,15 @@ def _final_readme_payload(
         title=title,
         content=(
             f"# {title}\n\n"
-            f"MVPilot turned this submitted idea into a small demo package: {idea}\n\n"
+            f"MVPilot turned this submitted idea into an idea-specific MVP package: {idea}\n\n"
             f"Resolved stack: {resolved_stack}.\n\n"
             "The package includes scoped requirements, generated artifacts, build "
-            "verification, blocker recovery, and a judge-ready final summary."
+            "verification, validation evidence, and a judge-ready final summary."
             f"{warning_note}"
         ),
         setup_steps=[
             "Install dependencies.",
-            "Run the FastAPI backend in mock mode.",
+            "Run the FastAPI backend.",
             "Submit the idea through the dashboard.",
         ],
         decision_trace=_trace(
@@ -752,18 +779,18 @@ def _demo_script_payload(
     warning_summary = _source_warning_summary(prompt)
     warning_note = f" Mention source warnings: {warning_summary}." if warning_summary else ""
     return DemoScriptOutput(
-        title=f"Three-minute {title} demo",
+        title=f"Three-minute {title} walkthrough",
         content=(
             f"Open with the submitted idea: {idea}. "
             "Show MVPilot retrieving context, scoping the MVP, generating repo "
-            "artifacts, hitting a build blocker, applying recovery, and ending "
-            "with README, script, and pitch content."
+            "artifacts, validating idea-specific output, committing to GitHub, and ending "
+            "with README, walkthrough, and pitch content."
             f"{warning_note}"
         ),
         beats=[
             "Enter the project idea.",
             "Watch the graph trace fill with model-backed decisions.",
-            "Show the recoverable build blocker and recovery step.",
+            "Show validation and any labeled partial/mocked integrations.",
             "Close on the generated package and pitch.",
         ],
         decision_trace=_trace(
@@ -771,7 +798,7 @@ def _demo_script_payload(
             fallback_reason,
             [
                 f"Built the script around observable {title} dashboard moments.",
-                "Kept the blocker in the story instead of hiding it.",
+                "Kept validation and delivery evidence visible instead of hiding generation work.",
             ],
         ),
     ).model_dump()
@@ -789,19 +816,19 @@ def _pitch_payload(
     content = (
         f"MVPilot helps teams move from idea to credible MVP evidence fast. "
         f"For {title}, {label}, it scopes the workflow, plans "
-        "the repo, generates artifacts, catches a build blocker, recovers, "
-        "and produces the final README, demo script, and pitch."
+        "the repo, generates idea-specific artifacts, validates the output, "
+        "and produces the final README, walkthrough script, and pitch."
     )
     if warning_summary:
         content = f"{content} {warning_summary}"
     return PitchOutput(
         title=title,
-        tagline="An AI teammate that turns messy hackathon ideas into demo packages.",
+        tagline="An AI teammate that turns messy hackathon ideas into committed MVP repositories.",
         content=content,
         proof_points=[
             "Stable FastAPI task contracts for frontend integration.",
             "Structured Nemotron-style reasoning on model-backed steps.",
-            "Visible blocker analysis and recovery before final packaging.",
+            "Visible validation and recovery before final packaging.",
         ],
         decision_trace=_trace(
             mode,

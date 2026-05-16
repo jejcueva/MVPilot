@@ -48,7 +48,17 @@ def test_github_connect_redirects_to_github_with_backend_state():
     assert "client-secret" not in location
 
 
-def test_github_connect_redirects_to_frontend_when_oauth_is_not_configured():
+def test_github_connect_redirects_to_frontend_when_oauth_is_not_configured(monkeypatch):
+    for key in (
+        "GITHUB_OAUTH_CLIENT_ID",
+        "GITHUB_OAUTH_CLIENT_SECRET",
+        "GITHUB_OAUTH_REDIRECT_URI",
+        "GITHUB_CLIENT_ID",
+        "GITHUB_CLIENT_SECRET",
+        "GITHUB_REDIRECT_URI",
+        "GITHUB_TOKEN_ENCRYPTION_KEY",
+    ):
+        monkeypatch.delenv(key, raising=False)
     app = create_app(
         settings=Settings(
             _env_file=None,
@@ -138,17 +148,16 @@ def test_github_callback_exchanges_token_and_redirects_safely():
 
     callback_query = parse_qs(urlparse(callback_response.headers["location"]).query)
     connection_id = callback_query["github_connection_id"][0]
-    assert callback_query["github_status"] == ["connected"]
-    assert callback_query["github_username"] == ["octocat"]
+    assert callback_query["github_status"] == ["ready"]
+    assert "github_username" not in callback_query
 
     record = app.state.github_connection_store.get_connection(connection_id)
-    assert record.status == "exchanged"
-    assert record.encrypted_pending_code is None
-    assert record.encrypted_access_token
-    assert record.encrypted_access_token != "gho-task-token"
-    assert app.state.github_connection_service.decrypt_access_token(record) == "gho-task-token"
-    assert record.github_login == "octocat"
-    assert record.github_user_id == 12345
+    assert record.status == "ready"
+    assert record.encrypted_pending_code
+    assert record.encrypted_access_token is None
+    assert app.state.github_connection_service.decrypt_pending_code(record) == "raw-oauth-code"
+    assert record.github_login is None
+    assert record.github_user_id is None
 
 
 @pytest.mark.asyncio

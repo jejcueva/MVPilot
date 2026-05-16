@@ -152,6 +152,8 @@ class AgentService:
             "openclaw_trace": detail.openclaw_trace,
             "generated_artifacts": detail.generated_artifacts,
             "graph_trace": [*detail.graph_trace, step],
+            "mvp_plan": detail.mvp_plan,
+            "build_timeline": detail.build_timeline,
             "final_report": {
                 "status": "failed",
                 "mode": "mock" if self._settings.mock_mode else "live",

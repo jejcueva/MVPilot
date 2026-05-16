@@ -110,7 +110,7 @@ class InMemoryToolAdapter:
         repo_url: str | None = None,
     ) -> dict[str, Any]:
         del repo_description
-        repo_name = repo_name or f"mvpilot-demo-{task_id[:8]}"
+        repo_name = repo_name or f"mvpilot-generated-{task_id[:8]}"
         return {
             "tool": "github.create_repo" if repo_preference == "create_new_repo" else "github.use_existing_repo",
             "status": "success",
@@ -122,9 +122,9 @@ class InMemoryToolAdapter:
                 "url": repo_url or f"https://github.com/mock-org/{repo_name}",
             },
             "summary": (
-                "Mock mode: created deterministic GitHub repository record."
+                "Test mode: created deterministic GitHub repository record."
                 if repo_preference == "create_new_repo"
-                else "Mock mode: attached deterministic existing GitHub repository record."
+                else "Test mode: attached deterministic existing GitHub repository record."
             ),
         }
 
@@ -138,7 +138,7 @@ class InMemoryToolAdapter:
             "files": files,
             "commit_sha": "mock-commit-0001",
             "commit_url": f"https://github.com/mock-org/{repo_name}/commit/mock-commit-0001",
-            "summary": "Mock mode: committed generated MVP package files.",
+            "summary": "Test mode: committed generated MVP package files.",
         }
 
     def check_repo_health(self, repo_name: str) -> dict[str, Any]:
@@ -153,8 +153,8 @@ class InMemoryToolAdapter:
         return {
             "has_blocker": True,
             "blocker_type": "missing_dependency",
-            "summary": "Mock mode: missing demo dependency in generated package.",
-            "recommended_fix": "Add deterministic demo dependency stub."
+            "summary": "Test mode: missing idea-specific generated artifact.",
+            "recommended_fix": "Add deterministic idea-specific artifact stub."
         }
 
     def verify_commit(self, repo_name: str, commit_sha: str) -> dict[str, Any]:
@@ -172,8 +172,8 @@ class InMemoryToolAdapter:
                 "status": "failed",
                 "mock_mode": True,
                 "recoverable": True,
-                "error": "Mock mode: missing demo dependency in generated package.",
-                "summary": "Mock mode: build failed with a recoverable dependency gap.",
+                "error": "Test mode: missing idea-specific generated artifact.",
+                "summary": "Test mode: build failed with a recoverable artifact gap.",
             }
         return {
             "tool": "build.verify",
@@ -181,7 +181,7 @@ class InMemoryToolAdapter:
             "mock_mode": True,
             "recoverable": False,
             "checks": ["unit", "lint", "package"],
-            "summary": "Mock mode: build verification passed after recovery.",
+            "summary": "Test mode: build verification passed after recovery.",
         }
 
     def recover_build(self) -> dict[str, Any]:
@@ -190,8 +190,8 @@ class InMemoryToolAdapter:
             "status": "success",
             "mock_mode": True,
             "recoverable": False,
-            "patch": "Add deterministic demo dependency stub.",
-            "summary": "Mock mode: applied recovery patch for the blocked build.",
+            "patch": "Add deterministic idea-specific artifact stub.",
+            "summary": "Test mode: applied recovery patch for the blocked build.",
         }
 
 

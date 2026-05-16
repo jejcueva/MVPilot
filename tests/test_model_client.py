@@ -5,7 +5,9 @@ import pytest
 import respx
 
 from agent.config import Settings
-from agent.model_client import DeterministicModelClient, NemotronModelClient
+from agent.idea_aware_partial import IdeaAwarePartialClient
+from agent.model_client import DeterministicModelClient, ModelClientError, NemotronModelClient
+from agent.prompts import build_file_manifest_prompt
 from agent.model_outputs import (
     BlockerAnalysisOutput,
     DemoScriptOutput,
@@ -67,10 +69,10 @@ async def test_deterministic_model_client_returns_all_structured_outputs(
 
 
 @pytest.mark.asyncio
-async def test_deterministic_fallback_marks_trace_clearly():
+async def test_deterministic_mock_stays_explicitly_in_test_mode():
     client = DeterministicModelClient(
-        mode="fallback",
-        fallback_reason="NVIDIA endpoint unavailable.",
+        mode="mock",
+        fallback_reason="Unit test client.",
     )
 
     result = await client.complete_structured(
@@ -80,11 +82,9 @@ async def test_deterministic_fallback_marks_trace_clearly():
         response_model=MvpScopeOutput,
     )
 
-    assert result.mode == "fallback"
-    assert result.fallback_reason == "NVIDIA endpoint unavailable."
-    assert result.output.decision_trace[0] == (
-        "Fallback mode: NVIDIA endpoint unavailable."
-    )
+    assert result.mode == "mock"
+    assert result.fallback_reason == "Unit test client."
+    assert result.output.decision_trace[0].startswith("Grounded the scope")
 
 
 @pytest.mark.asyncio
@@ -170,7 +170,7 @@ async def test_nemotron_client_polls_status_after_accepted_response():
 
 
 @pytest.mark.asyncio
-async def test_nemotron_client_falls_back_when_live_key_is_missing():
+async def test_nemotron_client_uses_partial_degradation_when_live_key_is_missing():
     settings = live_settings(nvidia_api_key=None)
 
     with respx.mock(assert_all_called=False, assert_all_mocked=False) as router:
@@ -182,16 +182,38 @@ async def test_nemotron_client_falls_back_when_live_key_is_missing():
         result = await client.complete_structured(
             purpose="scope_mvp",
             model="nvidia/nemotron",
-            prompt="Scope this MVP.",
+            prompt="Idea:\nStudyPilot helps students plan study sessions.\n\n",
             response_model=MvpScopeOutput,
         )
 
     assert not route.called
-    assert result.mode == "fallback"
+    assert result.mode == "partial"
     assert result.fallback_reason == "Missing NVIDIA_API_KEY for live mode."
-    assert result.output.decision_trace[0] == (
-        "Fallback mode: NVIDIA endpoint unavailable."
+    assert result.output.decision_trace[0].startswith("Partial mode:")
+
+
+@pytest.mark.asyncio
+async def test_nemotron_client_fails_without_live_model_or_idea_specific_partial():
+    settings = live_settings(
+        nvidia_api_key=None,
+        allow_idea_aware_partial=False,
     )
+
+    with respx.mock(assert_all_called=False, assert_all_mocked=False) as router:
+        route = router.post("https://nemotron.test/v1/chat/completions").mock(
+            return_value=httpx.Response(200, json={})
+        )
+        client = NemotronModelClient(settings)
+
+        with pytest.raises(ModelClientError, match="Live Nemotron is required"):
+            await client.complete_structured(
+                purpose="scope_mvp",
+                model="nvidia/nemotron",
+                prompt="Scope this MVP.",
+                response_model=MvpScopeOutput,
+            )
+
+    assert not route.called
 
 
 @pytest.mark.asyncio
@@ -202,7 +224,7 @@ async def test_nemotron_client_falls_back_when_live_key_is_missing():
         (httpx.Response(500, json={"error": "down"}), "HTTP 500 from Nemotron."),
     ],
 )
-async def test_nemotron_client_retries_then_falls_back_for_retryable_http_errors(
+async def test_nemotron_client_retries_then_uses_partial_for_retryable_http_errors(
     response,
     expected_reason,
 ):
@@ -217,17 +239,17 @@ async def test_nemotron_client_retries_then_falls_back_for_retryable_http_errors
         result = await client.complete_structured(
             purpose="scope_mvp",
             model="nvidia/nemotron",
-            prompt="Scope this MVP.",
+            prompt="Idea:\nStudyPilot helps students plan study sessions.\n\n",
             response_model=MvpScopeOutput,
         )
 
     assert route.call_count == 2
-    assert result.mode == "fallback"
+    assert result.mode == "partial"
     assert result.fallback_reason == expected_reason
 
 
 @pytest.mark.asyncio
-async def test_nemotron_client_retries_then_falls_back_for_timeout():
+async def test_nemotron_client_retries_then_uses_partial_for_timeout():
     settings = live_settings(nemotron_max_retries=1)
 
     with respx.mock(assert_all_called=True) as router:
@@ -239,12 +261,12 @@ async def test_nemotron_client_retries_then_falls_back_for_timeout():
         result = await client.complete_structured(
             purpose="scope_mvp",
             model="nvidia/nemotron",
-            prompt="Scope this MVP.",
+            prompt="Idea:\nStudyPilot helps students plan study sessions.\n\n",
             response_model=MvpScopeOutput,
         )
 
     assert route.call_count == 2
-    assert result.mode == "fallback"
+    assert result.mode == "partial"
     assert result.fallback_reason == "Nemotron request timed out."
 
 
@@ -262,7 +284,7 @@ async def test_nemotron_client_retries_then_falls_back_for_timeout():
         ),
     ],
 )
-async def test_nemotron_client_falls_back_for_bad_structured_output(
+async def test_nemotron_client_uses_partial_for_bad_structured_output(
     payload,
     expected_reason,
 ):
@@ -277,16 +299,16 @@ async def test_nemotron_client_falls_back_for_bad_structured_output(
         result = await client.complete_structured(
             purpose="scope_mvp",
             model="nvidia/nemotron",
-            prompt="Scope this MVP.",
+            prompt="Idea:\nStudyPilot helps students plan study sessions.\n\n",
             response_model=MvpScopeOutput,
         )
 
-    assert result.mode == "fallback"
+    assert result.mode == "partial"
     assert result.fallback_reason == expected_reason
 
 
 @pytest.mark.asyncio
-async def test_nemotron_client_falls_back_when_pending_status_times_out():
+async def test_nemotron_client_uses_partial_when_pending_status_times_out():
     settings = live_settings(nemotron_poll_attempts=1)
 
     with respx.mock(assert_all_called=True) as router:
@@ -301,9 +323,30 @@ async def test_nemotron_client_falls_back_when_pending_status_times_out():
         result = await client.complete_structured(
             purpose="scope_mvp",
             model="nvidia/nemotron",
-            prompt="Scope this MVP.",
+            prompt="Idea:\nStudyPilot helps students plan study sessions.\n\n",
             response_model=MvpScopeOutput,
         )
 
-    assert result.mode == "fallback"
+    assert result.mode == "partial"
     assert result.fallback_reason == "Nemotron request stayed pending."
+
+
+@pytest.mark.asyncio
+async def test_idea_aware_partial_file_manifest_uses_build_context():
+    client = IdeaAwarePartialClient(partial_reason="test")
+    prompt = build_file_manifest_prompt(
+        idea="Study planner for college students",
+        repo_plan={"files": [{"path": "frontend/app/page.tsx"}]},
+        build_context={
+            "resolvedTechStack": {"items": ["React", "FastAPI"]},
+            "sourceContext": {"warnings": [{"code": "no_uploads", "message": "No files uploaded."}]},
+        },
+    )
+    result = await client.complete_structured(
+        purpose="file_manifest",
+        model="test",
+        prompt=prompt,
+        response_model=FileManifestOutput,
+    )
+    assert result.mode == "partial"
+    assert len(result.output.artifacts) >= 1

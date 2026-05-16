@@ -30,7 +30,9 @@ def build_scope_mvp_prompt(
     del retrieved_docs
     resolved_stack = build_context.get("resolvedTechStack", {})
     return (
-        "Scope this hackathon idea into one demo-ready MVP.\n\n"
+        "Scope this hackathon idea into one MVP-ready build.\n"
+        "Do NOT default to a generic todo app, starter dashboard, or unrelated template.\n"
+        "Every feature must map to the submitted idea and intake fields.\n\n"
         f"Idea:\n{idea}\n\n"
         f"Prompt contract:\n{_context_contract()}\n\n"
         f"Frontend intake:\n{_json_block(build_context.get('frontendIntake', {}))}\n\n"
@@ -41,7 +43,7 @@ def build_scope_mvp_prompt(
         f"Memory matches:\n{_json_block(memory_matches)}\n\n"
         "Use resolvedTechStack as the stack decision. "
         "required stack items override MVPilot defaults. "
-        "Honor required deliverables, allowed tools/APIs, repository format, demo format, "
+        "Honor required deliverables, allowed tools/APIs, repository format, walkthrough format, "
         "resolved tech stack, and scope warnings from build context. "
         "Return target user, must-have features, demo boundary, mode, and a short decision trace."
     )
@@ -89,8 +91,11 @@ def build_file_manifest_prompt(
         f"Source context:\n{_json_block(build_context.get('sourceContext', {}))}\n\n"
         f"Resolved tech stack:\n{_json_block(resolved_stack)}\n\n"
         f"Repo plan:\n{_json_block(repo_plan)}\n\n"
+        f"Structured build context:\n{_json_block(build_context)}\n\n"
         "Return artifact names, kinds, summaries, full text content, mode, and "
-        "decision trace. Generate a real runnable MVP repository, not placeholder files. "
+        "decision trace. Generate a real runnable MVP repository tailored to this idea, "
+        "not a generic placeholder or unrelated starter app. "
+        "Label mock integrations clearly in code comments where external APIs are not wired. "
         "Include frontend files, backend/API files, database schema notes when persistence is useful, "
         "tests, README.md, docs/ARCHITECTURE.md, docs/IMPLEMENTATION_PLAN.md, "
         "docs/BUILD_LOG.md, demo/demo_script.md, package.json and/or requirements.txt, "

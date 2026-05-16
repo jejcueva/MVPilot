@@ -48,8 +48,21 @@ def verify_commit(
         return ToolResult.failure("github.verify_commit", "Commit SHA must not be empty.").model_dump(mode="json")
 
     active_config = config or GitHubConfig.from_env()
-    if active_config.mock_tools or not active_config.token:
+    if active_config.mock_tools:
         return _mock_verify_commit(repo_name, commit_sha).model_dump(mode="json")
+    if not active_config.token:
+        output = VerificationResult(
+            commit_sha=commit_sha,
+            verified=False,
+            files_changed=[],
+            error="GitHub OAuth token is required before MVPilot can verify commits.",
+        ).model_dump()
+        return ToolResult.failure(
+            "github.verify_commit",
+            "GitHub OAuth token is required before MVPilot can verify commits.",
+            output,
+            verification_status="failed",
+        ).model_dump(mode="json")
 
     client = GitHubClient(active_config)
     try:

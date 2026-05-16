@@ -53,6 +53,28 @@ type GeneratedArtifact = {
   content?: string;
 };
 
+type BuildTimelineEvent = {
+  id: string;
+  title: string;
+  category?: string;
+  status: string;
+  detail?: string;
+  artifacts?: string[];
+  updated_at?: string | null;
+};
+
+type MvpPlan = {
+  title?: string | null;
+  idea?: string;
+  target_users?: string | null;
+  tech_stack_preference?: string | null;
+  features?: string[];
+  architecture_notes?: string | null;
+  implementation_steps?: string[];
+  selected_stack?: string | null;
+  runtime?: string;
+};
+
 type TaskDetail = {
   task: {
     id: string;
@@ -60,6 +82,22 @@ type TaskDetail = {
     repo_visibility: RepoVisibility;
     repo_description?: string | null;
   };
+  runtime?: string;
+  mvp_plan?: MvpPlan | null;
+  build_timeline?: BuildTimelineEvent[];
+  mvp_validation?: {
+    passed?: boolean;
+    project_title?: string;
+    checks?: { name: string; passed: boolean; detail: string }[];
+  } | null;
+  mvp_delivery?: {
+    project_title?: string;
+    completed_features?: string[];
+    mocked_features?: string[];
+    pending_features?: string[];
+    validation_passed?: boolean;
+    model_modes?: string[];
+  } | null;
   agent_steps: WorkflowStep[];
   build_context?: {
     evidence?: RagEvidence[];
@@ -71,6 +109,10 @@ type TaskDetail = {
   final_report?: {
     status?: string;
     summary?: string;
+    mvp_plan?: TaskDetail["mvp_plan"];
+    build_timeline?: TaskDetail["build_timeline"];
+    mvp_delivery?: TaskDetail["mvp_delivery"];
+    mvp_validation?: TaskDetail["mvp_validation"];
     repo?: { url?: string | null; name?: string | null } | null;
     links?: {
       repoUrl?: string | null;
@@ -87,8 +129,11 @@ type AdditionalSource =
   | { id: number; type: "url"; value: string }
   | { id: number; type: "file"; file: File | null };
 
-const defaultTitle = "Healthcare Referral Coordinator";
-const defaultIdea = "Build a healthcare referral coordination agent that helps clinics prevent failed referrals.";
+const defaultTitle = "StudyPilot";
+const defaultIdea =
+  "Build StudyPilot, an AI study planner that turns messy course goals into weekly plans, focus sessions, and progress dashboards for college students.";
+/** Optional product/rules URL prefilled for localhost demo; clear the field to skip RAG fetch. */
+const defaultReferenceUrl = "https://www.shortesthack.com/?tab=rules";
 
 const flightStops: AgentStep[] = [
   { key: "preflight", phase: "PREFLIGHT", title: "Preflight Check", detail: "Package the idea, repo preference, GitHub connection, rules URL, and extra source material.", status: "Ready" },
@@ -110,6 +155,25 @@ type GithubOAuthConfig = {
   redirectUri?: string;
   missingEnv?: string[];
 };
+
+function clearGithubConnectingFlags() {
+  if (typeof window === "undefined") return;
+  window.sessionStorage.removeItem("mvpilot_github_connecting");
+  window.sessionStorage.removeItem("mvpilot_github_connecting_at");
+}
+
+function markGithubConnecting() {
+  if (typeof window === "undefined") return;
+  window.sessionStorage.setItem("mvpilot_github_connecting", "true");
+  window.sessionStorage.setItem("mvpilot_github_connecting_at", String(Date.now()));
+}
+
+function githubConnectingExpired(): boolean {
+  if (typeof window === "undefined") return false;
+  const startedAt = Number(window.sessionStorage.getItem("mvpilot_github_connecting_at") || "0");
+  if (!startedAt) return false;
+  return Date.now() - startedAt > 120_000;
+}
 
 function readGithubCallbackState(): {
   connectionId: string | null;
@@ -133,6 +197,7 @@ function readGithubCallbackState(): {
   if (connectionId && (status === "connected" || status === "ready")) {
     window.sessionStorage.setItem("mvpilot_github_connection_id", connectionId);
     if (username) window.sessionStorage.setItem("mvpilot_github_username", username);
+    clearGithubConnectingFlags();
     return { connectionId, username, error: null };
   }
 
@@ -155,7 +220,10 @@ function formatWorkflowError(message: string): string {
     ].join(" ");
   }
   if (message.includes("already exists") || message.includes("name already exists")) {
-    return `${message} Pick a different repo name and launch again.`;
+    return [
+      message,
+      "MVPilot will reuse an existing repo with the same name on the next launch, or you can change the repo name below.",
+    ].join(" ");
   }
   if (message.includes("Git Repository is empty") || message.includes("repository is empty")) {
     return [
@@ -165,6 +233,15 @@ function formatWorkflowError(message: string): string {
     ].join(" ");
   }
   return message;
+}
+
+async function fetchGithubStatus(apiBaseUrl: string, connectionId: string | null) {
+  if (!connectionId) return { connected: false, username: null, status: "missing" };
+  const response = await fetch(`${apiBaseUrl}/api/auth/github/status?github_connection_id=${encodeURIComponent(connectionId)}`, {
+    cache: "no-store",
+  });
+  if (!response.ok) return { connected: false, username: null, status: "error" };
+  return await response.json() as { connected: boolean; username?: string | null; status?: string };
 }
 
 function githubStatusPill(status: GithubStatus): StepStatus {
@@ -247,12 +324,19 @@ function deriveFlightStageState(taskDetail: TaskDetail | null, hasLaunched: bool
 export default function Home() {
   const [projectTitle, setProjectTitle] = useState(defaultTitle);
   const [idea, setIdea] = useState(defaultIdea);
-  const [repoDescription, setRepoDescription] = useState("A generated MVP built by MVPilot from the submitted idea.");
-  const [primaryRulesUrl, setPrimaryRulesUrl] = useState("");
+  const [targetUsers, setTargetUsers] = useState("College students balancing multiple courses");
+  const [techStackPreference, setTechStackPreference] = useState("React + Vite frontend, FastAPI backend, Postgres-ready schema");
+  const [requiredFeatures, setRequiredFeatures] = useState(
+    "Study goal intake, weekly plan generator, focus session tracker, progress dashboard, API health check",
+  );
+  const [repoDescription, setRepoDescription] = useState(
+    "StudyPilot — an autonomous MVP generated by MVPilot.",
+  );
+  const [primaryRulesUrl, setPrimaryRulesUrl] = useState(defaultReferenceUrl);
   const [additionalSources, setAdditionalSources] = useState<AdditionalSource[]>([]);
   const [nextSourceType, setNextSourceType] = useState<AdditionalSourceType>("url");
   const [repoPreference, setRepoPreference] = useState<RepoPreference>("create_new_repo");
-  const [requestedRepoName, setRequestedRepoName] = useState("mvpilot-generated-demo");
+  const [requestedRepoName, setRequestedRepoName] = useState("mvpilot-generated-studypilot");
   const [existingRepoUrl, setExistingRepoUrl] = useState("");
   const [visibility, setVisibility] = useState<RepoVisibility>("private");
   const [githubConnectionId, setGithubConnectionId] = useState<string | null>(null);
@@ -262,36 +346,62 @@ export default function Home() {
   const [githubMessage, setGithubMessage] = useState("Connect GitHub so MVPilot can create the project repo through backend OAuth.");
   const [taskId, setTaskId] = useState<string | null>(null);
   const [taskDetail, setTaskDetail] = useState<TaskDetail | null>(null);
-  const [submitState, setSubmitState] = useState<"idle" | "sending" | "sent" | "mocked" | "error">("idle");
+  const [submitState, setSubmitState] = useState<"idle" | "sending" | "sent" | "error">("idle");
   const [message, setMessage] = useState("Ready for preflight. Add the build brief and launch MVPilot.");
 
   useEffect(() => {
     const apiBaseUrl = process.env.NEXT_PUBLIC_AGENT_API_URL;
-    const { connectionId, username, error } = readGithubCallbackState();
-    const wasConnecting = window.sessionStorage.getItem("mvpilot_github_connecting") === "true";
 
-    if (error) {
-      setGithubMessage(error);
-      setGithubStatus("error");
-      window.sessionStorage.removeItem("mvpilot_github_connecting");
-      window.history.replaceState({}, "", window.location.pathname);
-    } else if (connectionId) {
-      setGithubConnectionId(connectionId);
-      setGithubUsername(username);
-      setGithubStatus("connected");
-      setGithubMessage(username ? `Connected as ${username}.` : "GitHub connected. Repo creation is ready.");
-      window.sessionStorage.removeItem("mvpilot_github_connecting");
-      window.history.replaceState({}, "", window.location.pathname);
-    } else if (wasConnecting) {
-      setGithubStatus("connecting");
-      setGithubMessage("Waiting for GitHub OAuth to finish...");
+    async function restoreGithubSession() {
+      const { connectionId, username, error } = readGithubCallbackState();
+      const wasConnecting = window.sessionStorage.getItem("mvpilot_github_connecting") === "true";
+
+      if (error) {
+        setGithubMessage(error);
+        setGithubStatus("error");
+        clearGithubConnectingFlags();
+        window.history.replaceState({}, "", window.location.pathname);
+        return;
+      }
+
+      if (connectionId && apiBaseUrl) {
+        const status = await fetchGithubStatus(apiBaseUrl, connectionId);
+        if (status.connected) {
+          setGithubConnectionId(connectionId);
+          setGithubUsername(status.username || username);
+          setGithubStatus("connected");
+          setGithubMessage(
+            status.username || username
+              ? `Connected as ${status.username || username}.`
+              : "GitHub connected. Repo creation is ready.",
+          );
+          clearGithubConnectingFlags();
+          window.history.replaceState({}, "", window.location.pathname);
+          return;
+        }
+      }
+
+      if (wasConnecting) {
+        if (githubConnectingExpired()) {
+          clearGithubConnectingFlags();
+          setGithubStatus("error");
+          setGithubMessage("GitHub sign-in timed out. Click Retry GitHub to try again.");
+          return;
+        }
+        setGithubStatus("connecting");
+        setGithubMessage("Finishing GitHub sign-in...");
+      }
     }
+
+    void restoreGithubSession();
 
     const storedTaskId = window.sessionStorage.getItem("mvpilot_task_id");
     if (storedTaskId) {
-      setTaskId(storedTaskId);
-      setSubmitState("sent");
-      setMessage("Resuming flight telemetry for your in-progress run…");
+      window.setTimeout(() => {
+        setTaskId(storedTaskId);
+        setSubmitState("sent");
+        setMessage("Resuming flight telemetry for your in-progress run...");
+      }, 0);
     }
 
     if (!apiBaseUrl) return;
@@ -302,6 +412,7 @@ export default function Home() {
         if (!config) return;
         const typed = config as GithubOAuthConfig;
         setGithubOAuthConfig(typed);
+        const { connectionId, error } = readGithubCallbackState();
         if (!connectionId && !error && !typed.oauthConfigured) {
           setGithubStatus("error");
           setGithubMessage(
@@ -311,6 +422,66 @@ export default function Home() {
       })
       .catch(() => undefined);
   }, []);
+
+  useEffect(() => {
+    if (githubStatus !== "connecting") return;
+    const apiBaseUrl = process.env.NEXT_PUBLIC_AGENT_API_URL;
+    if (!apiBaseUrl) {
+      window.setTimeout(() => {
+        setGithubStatus("error");
+        setGithubMessage("Missing NEXT_PUBLIC_AGENT_API_URL. Start the FastAPI backend before connecting GitHub.");
+        clearGithubConnectingFlags();
+      }, 0);
+      return;
+    }
+    const githubApiBaseUrl = apiBaseUrl;
+
+    let cancelled = false;
+
+    async function pollGithubConnection() {
+      if (cancelled) return;
+
+      if (githubConnectingExpired()) {
+        clearGithubConnectingFlags();
+        setGithubStatus("error");
+        setGithubMessage("GitHub sign-in timed out. Click Retry GitHub to try again.");
+        return;
+      }
+
+      const { connectionId, username, error } = readGithubCallbackState();
+      if (error) {
+        setGithubStatus("error");
+        setGithubMessage(error);
+        clearGithubConnectingFlags();
+        window.history.replaceState({}, "", window.location.pathname);
+        return;
+      }
+
+      if (!connectionId) return;
+
+      const status = await fetchGithubStatus(githubApiBaseUrl, connectionId);
+      if (cancelled) return;
+      if (!status.connected) return;
+
+      setGithubConnectionId(connectionId);
+      setGithubUsername(status.username || username);
+      setGithubStatus("connected");
+      setGithubMessage(
+        status.username || username
+          ? `Connected as ${status.username || username}.`
+          : "GitHub connected. Repo creation is ready.",
+      );
+      clearGithubConnectingFlags();
+      window.history.replaceState({}, "", window.location.pathname);
+    }
+
+    void pollGithubConnection();
+    const intervalId = window.setInterval(() => void pollGithubConnection(), 1500);
+    return () => {
+      cancelled = true;
+      window.clearInterval(intervalId);
+    };
+  }, [githubStatus]);
 
   useEffect(() => {
     if (!taskId || !process.env.NEXT_PUBLIC_AGENT_API_URL || submitState === "idle") {
@@ -378,10 +549,27 @@ export default function Home() {
       repoDescription: repoDescription.trim() || null,
       repoUrl: repoPreference === "use_existing_repo" ? existingRepoUrl.trim() || null : null,
       visibility,
+      targetUsers: targetUsers.trim() || null,
+      techStackPreference: techStackPreference.trim() || null,
+      requiredFeatures: requiredFeatures
+        .split(",")
+        .map((item) => item.trim())
+        .filter(Boolean),
       source: "mvpilot_frontend",
     }),
-    [additionalSources, existingRepoUrl, githubConnectionId, idea, primaryRulesUrl, projectTitle, repoDescription, repoPreference, requestedRepoName, visibility],
+    [additionalSources, existingRepoUrl, githubConnectionId, idea, primaryRulesUrl, projectTitle, repoDescription, repoPreference, requestedRepoName, requiredFeatures, targetUsers, techStackPreference, visibility],
   );
+
+  const buildTimeline = taskDetail?.build_timeline ?? [];
+  const mvpPlan = taskDetail?.mvp_plan ?? taskDetail?.final_report?.mvp_plan ?? null;
+  const rawMvpDelivery = taskDetail?.mvp_delivery ?? taskDetail?.final_report?.mvp_delivery ?? null;
+  const rawMvpValidation = taskDetail?.mvp_validation ?? taskDetail?.final_report?.mvp_validation ?? null;
+  const mvpValidation =
+    rawMvpValidation && Array.isArray(rawMvpValidation.checks) && rawMvpValidation.checks.length > 0
+      ? rawMvpValidation
+      : null;
+  const mvpDelivery =
+    rawMvpDelivery && typeof rawMvpDelivery.validation_passed === "boolean" ? rawMvpDelivery : null;
 
   const hasLaunched = Boolean(taskId);
   const runFailed = submitState === "error";
@@ -437,7 +625,7 @@ export default function Home() {
 
     setGithubStatus("connecting");
     setGithubMessage("Opening GitHub OAuth...");
-    window.sessionStorage.setItem("mvpilot_github_connecting", "true");
+    markGithubConnecting();
     window.location.assign(`${apiBaseUrl}/api/auth/github/login?${params.toString()}`);
   }
 
@@ -463,17 +651,8 @@ export default function Home() {
     setGithubStatus("not_connected");
     window.sessionStorage.removeItem("mvpilot_github_connection_id");
     window.sessionStorage.removeItem("mvpilot_github_username");
-    window.sessionStorage.removeItem("mvpilot_github_connecting");
+    clearGithubConnectingFlags();
     setGithubMessage("GitHub disconnected for this browser session.");
-  }
-
-  async function checkGithubStatus(apiBaseUrl: string) {
-    if (!githubConnectionId) return { connected: false, username: null, status: "missing" };
-    const response = await fetch(`${apiBaseUrl}/api/auth/github/status?github_connection_id=${encodeURIComponent(githubConnectionId)}`, {
-      cache: "no-store",
-    });
-    if (!response.ok) return { connected: false, username: null, status: "error" };
-    return await response.json() as { connected: boolean; username?: string | null; status?: string };
   }
 
   function addSource() {
@@ -529,14 +708,12 @@ export default function Home() {
     const apiBaseUrl = process.env.NEXT_PUBLIC_AGENT_API_URL;
 
     if (!apiBaseUrl) {
-      const mockTaskId = `mock-${Date.now()}`;
-      setTaskId(mockTaskId);
-      setSubmitState("mocked");
-      setMessage("No backend URL is configured yet, so MVPilot is showing a mock flight path. Add NEXT_PUBLIC_AGENT_API_URL when Person 1's FastAPI service is ready.");
+      setSubmitState("error");
+      setMessage("NEXT_PUBLIC_AGENT_API_URL is missing. Configure the FastAPI backend URL before launching a real MVPilot build.");
       return;
     }
 
-    const githubStatus = await checkGithubStatus(apiBaseUrl);
+    const githubStatus = await fetchGithubStatus(apiBaseUrl, githubConnectionId);
     if (!githubStatus.connected) {
       setSubmitState("error");
       setGithubStatus("error");
@@ -557,6 +734,9 @@ export default function Home() {
     if (repoDescription.trim()) formData.append("repoDescription", repoDescription.trim());
     if (repoPreference === "create_new_repo") formData.append("repoName", requestedRepoName.trim());
     if (repoPreference === "use_existing_repo") formData.append("repoUrl", existingRepoUrl.trim());
+    if (targetUsers.trim()) formData.append("targetUsers", targetUsers.trim());
+    if (techStackPreference.trim()) formData.append("techStackPreference", techStackPreference.trim());
+    payloadPreview.requiredFeatures.forEach((feature) => formData.append("requiredFeatures", feature));
     formData.append("source", "mvpilot_frontend");
 
     if (githubConnectionId) {
@@ -640,10 +820,19 @@ export default function Home() {
                   </div>
 
                   <label className="mt-5 block font-mono text-[11px] font-bold uppercase tracking-widest text-[#b9cacb]" htmlFor="project-title">Project title</label>
-                  <input id="project-title" type="text" required value={projectTitle} onChange={(event) => setProjectTitle(event.target.value)} placeholder="Healthcare Referral Coordinator" className="mt-2 w-full rounded border border-[#3a494b] bg-[#0a0e17] px-3 py-2 font-mono text-sm leading-6 text-[#e1fdff] outline-none transition focus:border-[#00f2ff] focus:ring-1 focus:ring-[#00f2ff]/40" />
+                  <input id="project-title" type="text" required value={projectTitle} onChange={(event) => setProjectTitle(event.target.value)} placeholder="StudyPilot" className="mt-2 w-full rounded border border-[#3a494b] bg-[#0a0e17] px-3 py-2 font-mono text-sm leading-6 text-[#e1fdff] outline-none transition focus:border-[#00f2ff] focus:ring-1 focus:ring-[#00f2ff]/40" />
 
                   <label className="mt-4 block font-mono text-[11px] font-bold uppercase tracking-widest text-[#b9cacb]" htmlFor="idea">Project idea</label>
                   <textarea id="idea" value={idea} onChange={(event) => setIdea(event.target.value)} rows={4} className="mt-2 w-full resize-none rounded border border-[#3a494b] bg-[#0a0e17] px-3 py-2 font-mono text-sm leading-6 text-[#e1fdff] outline-none transition focus:border-[#00f2ff] focus:ring-1 focus:ring-[#00f2ff]/40" />
+
+                  <label className="mt-4 block font-mono text-[11px] font-bold uppercase tracking-widest text-[#b9cacb]" htmlFor="target-users">Target users</label>
+                  <input id="target-users" type="text" value={targetUsers} onChange={(event) => setTargetUsers(event.target.value)} placeholder="Who is this MVP for?" className="mt-2 w-full rounded border border-[#3a494b] bg-[#0a0e17] px-3 py-2 font-mono text-sm leading-6 text-[#e1fdff] outline-none transition focus:border-[#00f2ff] focus:ring-1 focus:ring-[#00f2ff]/40" />
+
+                  <label className="mt-4 block font-mono text-[11px] font-bold uppercase tracking-widest text-[#b9cacb]" htmlFor="tech-stack">Tech stack preference</label>
+                  <input id="tech-stack" type="text" value={techStackPreference} onChange={(event) => setTechStackPreference(event.target.value)} placeholder="React, FastAPI, Postgres..." className="mt-2 w-full rounded border border-[#3a494b] bg-[#0a0e17] px-3 py-2 font-mono text-sm leading-6 text-[#e1fdff] outline-none transition focus:border-[#00f2ff] focus:ring-1 focus:ring-[#00f2ff]/40" />
+
+                  <label className="mt-4 block font-mono text-[11px] font-bold uppercase tracking-widest text-[#b9cacb]" htmlFor="required-features">Required features (comma-separated)</label>
+                  <textarea id="required-features" value={requiredFeatures} onChange={(event) => setRequiredFeatures(event.target.value)} rows={2} className="mt-2 w-full resize-none rounded border border-[#3a494b] bg-[#0a0e17] px-3 py-2 font-mono text-sm leading-6 text-[#e1fdff] outline-none transition focus:border-[#00f2ff] focus:ring-1 focus:ring-[#00f2ff]/40" />
 
                   <label className="mt-4 block font-mono text-[11px] font-bold uppercase tracking-widest text-[#b9cacb]" htmlFor="repo-description">Repo description</label>
                   <input id="repo-description" type="text" value={repoDescription} onChange={(event) => setRepoDescription(event.target.value)} placeholder="Optional GitHub repository description" className="mt-2 w-full rounded border border-[#3a494b] bg-[#0a0e17] px-3 py-2 font-mono text-sm leading-6 text-[#e1fdff] outline-none transition focus:border-[#00f2ff] focus:ring-1 focus:ring-[#00f2ff]/40" />
@@ -660,11 +849,15 @@ export default function Home() {
                         <button
                           type="button"
                           onClick={connectGitHub}
-                          disabled={githubOAuthConfig !== null && !oauthReady}
+                          disabled={githubStatus === "connecting" || (githubOAuthConfig !== null && !oauthReady)}
                           title={oauthReady ? "Sign in with GitHub OAuth" : "OAuth is not configured in backend .env"}
                           className="rounded bg-[#00f2ff] px-3 py-2 font-mono text-xs font-bold uppercase tracking-widest text-[#00363a] transition hover:shadow-[0_0_15px_rgba(0,242,255,0.28)] disabled:cursor-not-allowed disabled:bg-[#31353f] disabled:text-[#849495]"
                         >
-                          {githubStatus === "error" ? "Retry GitHub" : "Connect GitHub"}
+                          {githubStatus === "connecting"
+                            ? "Connecting..."
+                            : githubStatus === "error"
+                              ? "Retry GitHub"
+                              : "Connect GitHub"}
                         </button>
                       )}
                     </div>
@@ -707,7 +900,7 @@ export default function Home() {
                       <label className="mt-3 block">
                         <span className="font-mono text-[10px] font-bold uppercase tracking-widest text-[#b9cacb]">Repo name</span>
                         <input type="text" value={requestedRepoName} onChange={(event) => setRequestedRepoName(event.target.value)} placeholder="mvpilot-generated-your-idea" className="mt-2 w-full rounded border border-[#3a494b] bg-[#0a0e17] px-3 py-2 font-mono text-sm leading-6 text-[#e1fdff] outline-none transition focus:border-[#00f2ff]" />
-                        <p className="mt-1 font-mono text-[10px] text-[#849495]">Must start with mvpilot-generated- (mvpilot-demo is auto-corrected).</p>
+                        <p className="mt-1 font-mono text-[10px] text-[#849495]">Must start with mvpilot-generated- so repo actions stay scoped to MVPilot output.</p>
                       </label>
                     ) : (
                       <label className="mt-3 block">
@@ -718,7 +911,8 @@ export default function Home() {
                   </section>
 
                   <label className="mt-4 block font-mono text-[11px] font-bold uppercase tracking-widest text-[#b9cacb]" htmlFor="primary-rules-url">Optional reference URL</label>
-                  <input id="primary-rules-url" type="url" value={primaryRulesUrl} onChange={(event) => setPrimaryRulesUrl(event.target.value)} placeholder="https://example.com/product-docs-or-rules" className="mt-2 w-full rounded border border-[#3a494b] bg-[#0a0e17] px-3 py-2 font-mono text-sm leading-6 text-[#e1fdff] outline-none transition focus:border-[#00f2ff] focus:ring-1 focus:ring-[#00f2ff]/40" />
+                  <input id="primary-rules-url" type="url" value={primaryRulesUrl} onChange={(event) => setPrimaryRulesUrl(event.target.value)} placeholder="https://example.com/product-docs (optional)" className="mt-2 w-full rounded border border-[#3a494b] bg-[#0a0e17] px-3 py-2 font-mono text-sm leading-6 text-[#e1fdff] outline-none transition focus:border-[#00f2ff] focus:ring-1 focus:ring-[#00f2ff]/40" />
+                  <p className="mt-1 font-mono text-[10px] text-[#849495]">Optional product or rules context. Delete to skip external RAG fetch.</p>
 
                   <div className="mt-5 rounded-lg border border-[#3a494b]/70 bg-[#1c1f29]/70 p-3">
                     <div className="flex flex-col gap-3 sm:flex-row sm:items-end sm:justify-between">
@@ -828,6 +1022,77 @@ export default function Home() {
                     </div>
                   </div>
                 </div>
+
+                <div className="grid gap-5 lg:grid-cols-2">
+                  <div className="rounded-lg border border-[#00f2ff]/15 bg-[#181b25]/75 p-5 shadow-[inset_0_1px_0_rgba(255,255,255,0.05)]">
+                    <p className="font-mono text-[11px] font-bold uppercase tracking-widest text-[#00f2ff]">OpenClaw Build Timeline</p>
+                    <h3 className="mt-2 text-xl font-semibold text-[#dfe2ef]">{taskDetail?.runtime === "openclaw" ? "OpenClaw orchestration" : "LangGraph orchestration"}</h3>
+                    <div className="mt-4 grid max-h-80 gap-2 overflow-y-auto">
+                      {buildTimeline.map((phase) => (
+                        <div key={phase.id} className="rounded border border-[#3a494b] bg-[#0a0e17] p-3">
+                          <div className="flex items-center justify-between gap-3">
+                            <p className="font-mono text-xs font-bold uppercase tracking-widest text-[#e1fdff]">{phase.title}</p>
+                            <StatusPill status={phase.status === "completed" ? "Complete" : phase.status === "running" ? "Running" : phase.status === "failed" ? "Failed" : "Pending"} />
+                          </div>
+                          {phase.detail ? <p className="mt-2 text-sm leading-6 text-[#b9cacb]">{phase.detail}</p> : null}
+                        </div>
+                      ))}
+                      {!buildTimeline.length ? <p className="text-sm text-[#849495]">Timeline phases appear as the builder progresses.</p> : null}
+                    </div>
+                  </div>
+                  <div className="rounded-lg border border-[#4edea3]/20 bg-[#181b25]/75 p-5 shadow-[inset_0_1px_0_rgba(255,255,255,0.05)]">
+                    <p className="font-mono text-[11px] font-bold uppercase tracking-widest text-[#4edea3]">MVP Plan</p>
+                    <h3 className="mt-2 text-xl font-semibold text-[#dfe2ef]">{mvpPlan?.title || payloadPreview.title}</h3>
+                    {mvpPlan?.features?.length ? (
+                      <ul className="mt-3 list-disc space-y-1 pl-5 text-sm text-[#b9cacb]">{mvpPlan.features.map((f) => <li key={f}>{f}</li>)}</ul>
+                    ) : <p className="mt-3 text-sm text-[#849495]">Plan details appear after scope + repo planning.</p>}
+                  </div>
+                </div>
+
+                {mvpValidation ? (
+                  <div className="grid gap-5 lg:grid-cols-2">
+                    <div className="rounded-lg border border-[#ffb86c]/25 bg-[#181b25]/75 p-5 shadow-[inset_0_1px_0_rgba(255,255,255,0.05)]">
+                      <p className="font-mono text-[11px] font-bold uppercase tracking-widest text-[#ffb86c]">MVP Delivery</p>
+                      <h3 className="mt-2 text-xl font-semibold text-[#dfe2ef]">{mvpDelivery?.project_title || mvpPlan?.title || payloadPreview.title}</h3>
+                      {mvpDelivery?.model_modes?.length ? (
+                        <p className="mt-2 font-mono text-xs text-[#849495]">Model modes: {mvpDelivery.model_modes.join(", ")}</p>
+                      ) : null}
+                      {mvpDelivery?.completed_features?.length ? (
+                        <div className="mt-3">
+                          <p className="font-mono text-[10px] font-bold uppercase tracking-widest text-[#4edea3]">Completed</p>
+                          <ul className="mt-1 list-disc space-y-1 pl-5 text-sm text-[#b9cacb]">{mvpDelivery.completed_features.map((f) => <li key={f}>{f}</li>)}</ul>
+                        </div>
+                      ) : null}
+                      {mvpDelivery?.mocked_features?.length ? (
+                        <div className="mt-3">
+                          <p className="font-mono text-[10px] font-bold uppercase tracking-widest text-[#00f2ff]">Mocked</p>
+                          <ul className="mt-1 list-disc space-y-1 pl-5 text-sm text-[#b9cacb]">{mvpDelivery.mocked_features.map((f) => <li key={f}>{f}</li>)}</ul>
+                        </div>
+                      ) : null}
+                      {mvpDelivery?.pending_features?.length ? (
+                        <div className="mt-3">
+                          <p className="font-mono text-[10px] font-bold uppercase tracking-widest text-[#ffb4ab]">Pending</p>
+                          <ul className="mt-1 list-disc space-y-1 pl-5 text-sm text-[#b9cacb]">{mvpDelivery.pending_features.map((f) => <li key={f}>{f}</li>)}</ul>
+                        </div>
+                      ) : null}
+                    </div>
+                    <div className="rounded-lg border border-[#00f2ff]/15 bg-[#181b25]/75 p-5 shadow-[inset_0_1px_0_rgba(255,255,255,0.05)]">
+                      <p className="font-mono text-[11px] font-bold uppercase tracking-widest text-[#00f2ff]">Idea Validation</p>
+                      <div className="mt-2 flex items-center gap-3">
+                        <h3 className="text-xl font-semibold text-[#dfe2ef]">{mvpValidation?.passed ? "Aligned with your idea" : "Review recommended"}</h3>
+                        <StatusPill status={mvpValidation?.passed ? "Complete" : "Failed"} />
+                      </div>
+                      <div className="mt-4 grid max-h-56 gap-2 overflow-y-auto">
+                        {(mvpValidation?.checks ?? []).map((check) => (
+                          <div key={check.name} className="rounded border border-[#3a494b] bg-[#0a0e17] p-3">
+                            <p className="font-mono text-xs font-bold uppercase tracking-widest text-[#e1fdff]">{check.name.replaceAll("_", " ")}</p>
+                            <p className="mt-1 text-sm text-[#b9cacb]">{check.detail}</p>
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                  </div>
+                ) : null}
 
                 <div className="grid gap-5 lg:grid-cols-3">
                   <div className="rounded-lg border border-[#00f2ff]/15 bg-[#181b25]/75 p-5 shadow-[inset_0_1px_0_rgba(255,255,255,0.05)] lg:col-span-3">

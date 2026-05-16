@@ -115,7 +115,10 @@ def _sample_rag_chunks() -> list[RagSearchResult]:
 @pytest.fixture
 def settings(monkeypatch) -> Settings:
     monkeypatch.delenv("OPENCLAW_API_KEY", raising=False)
-    return Settings(_env_file=None, adapter_mode="mock")
+    return Settings(
+        _env_file=None,
+        adapter_mode="mock",
+    )
 
 
 @pytest.fixture
