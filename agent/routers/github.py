@@ -209,10 +209,11 @@ async def _complete_github_oauth(
 
     try:
         record = service.complete_callback(code=code, state=state)
-        await service.exchange_for_workflow(record.id, task_id=None)
-        record = service.store.get_connection(record.id)
     except GitHubOAuthError as exc:
         return RedirectResponse(service.redirect_url_for_error(return_to, str(exc)))
+
+    # Redirect immediately so the browser is not stuck on the callback URL.
+    # Token exchange runs during workflow launch (exchange_github_code node).
     return RedirectResponse(service.redirect_url_for_completed_callback(record))
 
 

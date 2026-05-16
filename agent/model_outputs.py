@@ -5,7 +5,7 @@ from typing import Literal
 from pydantic import BaseModel, Field
 
 
-ModelOutputMode = Literal["mock", "live", "fallback"]
+ModelOutputMode = Literal["mock", "live", "partial"]
 
 
 class TracedModelOutput(BaseModel):

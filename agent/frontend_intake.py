@@ -55,6 +55,9 @@ class FrontendIntake(BaseModel):
     uploadedFiles: list[UploadedSourceFile] = Field(default_factory=list)
     githubConnected: bool = False
     githubConnectionId: str | None = None
+    targetUsers: str | None = None
+    techStackPreference: str | None = None
+    requiredFeatures: list[str] = Field(default_factory=list)
 
     @field_validator(
         "title",
@@ -68,6 +71,8 @@ class FrontendIntake(BaseModel):
         "visibility",
         "branch",
         "githubConnectionId",
+        "targetUsers",
+        "techStackPreference",
         mode="before",
     )
     @classmethod
@@ -76,6 +81,17 @@ class FrontendIntake(BaseModel):
             stripped = value.strip()
             return stripped or None
         return value
+
+    @field_validator("requiredFeatures", mode="before")
+    @classmethod
+    def coerce_required_features(cls, value: object) -> list[str]:
+        if value is None:
+            return []
+        if isinstance(value, str):
+            return [part.strip() for part in value.split(",") if part.strip()]
+        if isinstance(value, (list, tuple, set)):
+            return [str(item).strip() for item in value if str(item).strip()]
+        return []
 
     @field_validator("additionalUrls")
     @classmethod
@@ -119,6 +135,9 @@ def build_frontend_intake_from_request(request: RunAgentRequest) -> FrontendInta
         ),
         githubConnected=request.github_connected,
         githubConnectionId=request.github_connection_id,
+        targetUsers=request.target_users,
+        techStackPreference=request.tech_stack_preference,
+        requiredFeatures=list(request.required_features),
     )
 
 
@@ -138,6 +157,9 @@ def build_frontend_intake_from_task(task: TaskRecord) -> FrontendIntake:
         uploadedFiles=task.additional_files,
         githubConnected=task.github_connected,
         githubConnectionId=task.github_connection_id,
+        targetUsers=task.target_users,
+        techStackPreference=task.tech_stack_preference,
+        requiredFeatures=list(task.required_features),
     )
 
 
@@ -148,6 +170,12 @@ def build_optional_params_from_frontend_intake(
     optional_params: dict[str, Any] = {}
     if features:
         optional_params["features"] = features
+    if intake.targetUsers:
+        optional_params["targetUsers"] = intake.targetUsers
+    if intake.techStackPreference:
+        optional_params["techStackPreference"] = intake.techStackPreference
+    if intake.requiredFeatures:
+        optional_params["requiredFeatures"] = intake.requiredFeatures
     if intake.githubConnected:
         optional_params["repoPreference"] = "GitHub-connected repository handoff"
     optional_params["repoPreference"] = intake.repoPreference

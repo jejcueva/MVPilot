@@ -94,6 +94,18 @@ class RunAgentRequest(BaseModel):
     )
     github_connected: bool = False
     github_connection_id: str | None = None
+    target_users: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices("target_users", "targetUsers"),
+    )
+    tech_stack_preference: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices("tech_stack_preference", "techStackPreference"),
+    )
+    required_features: list[str] = Field(
+        default_factory=list,
+        validation_alias=AliasChoices("required_features", "requiredFeatures"),
+    )
 
     @field_validator(
         "title",
@@ -106,6 +118,8 @@ class RunAgentRequest(BaseModel):
         "repo_url",
         "branch",
         "github_connection_id",
+        "target_users",
+        "tech_stack_preference",
         mode="before",
     )
     @classmethod
@@ -114,6 +128,20 @@ class RunAgentRequest(BaseModel):
             stripped = value.strip()
             return stripped or None
         return value
+
+    @field_validator("required_features", mode="before")
+    @classmethod
+    def coerce_required_features(cls, value: object) -> list[str]:
+        if value is None:
+            return []
+        if isinstance(value, str):
+            stripped = value.strip()
+            if not stripped:
+                return []
+            return [part.strip() for part in stripped.split(",") if part.strip()]
+        if isinstance(value, (list, tuple, set)):
+            return [str(item).strip() for item in value if str(item).strip()]
+        return []
 
     @field_validator("additional_urls", mode="before")
     @classmethod
@@ -184,6 +212,9 @@ class TaskRecord(BaseModel):
     additional_files: list[UploadedSourceFile] = Field(default_factory=list)
     github_connected: bool = False
     github_connection_id: str | None = None
+    target_users: str | None = None
+    tech_stack_preference: str | None = None
+    required_features: list[str] = Field(default_factory=list)
     status: TaskStatus
     created_at: datetime
     updated_at: datetime
@@ -198,7 +229,7 @@ class AgentStep(BaseModel):
     message: str
     model: str | None = None
     prompt_purpose: str | None = None
-    model_mode: Literal["mock", "live", "fallback"] | None = None
+    model_mode: Literal["mock", "live", "partial"] | None = None
     decision_trace: list[str] = Field(default_factory=list)
     timestamp: datetime
 
@@ -227,6 +258,10 @@ class TaskDetailResponse(BaseModel):
     approvals: list[ApprovalRecord] = Field(default_factory=list)
     generated_artifacts: list[dict[str, Any]] = Field(default_factory=list)
     graph_trace: list[AgentStep] = Field(default_factory=list)
+    mvp_plan: dict[str, Any] | None = None
+    build_timeline: list[dict[str, Any]] = Field(default_factory=list)
+    mvp_validation: dict[str, Any] | None = None
+    mvp_delivery: dict[str, Any] | None = None
     final_report: dict[str, Any] | None = None
 
 

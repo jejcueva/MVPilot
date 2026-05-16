@@ -24,6 +24,9 @@ def build_project_artifacts(
     resolved_stack: str,
     repo_plan: dict[str, Any] | None = None,
     source_warnings: list[dict[str, str]] | None = None,
+    target_users: str | None = None,
+    required_features: list[str] | None = None,
+    tech_stack_preference: str | None = None,
 ) -> list[dict[str, str]]:
     """Create a complete, commit-safe MVP repository from the orchestrator plan."""
 
@@ -32,22 +35,18 @@ def build_project_artifacts(
     feature_label = _feature_label(idea)
     warning_lines = _warning_lines(source_warnings or [])
     plan_steps = _plan_steps(repo_plan or {})
-    selected_stack = _selected_stack(repo_plan or {}, resolved_stack)
+    selected_stack = tech_stack_preference or _selected_stack(repo_plan or {}, resolved_stack)
     user_story = _user_story(idea)
-    domain = _domain_context(project_title, idea)
+    audience = _clean_text(target_users or "") or "Early adopters validating the core workflow"
 
-    backend_features = [
-        f"Capture {domain['record_label'].lower()} requests with priority, owner, and due date.",
-        f"Turn each intake into a {domain['workflow_label'].lower()} workflow with next actions.",
-        f"Expose {domain['metric_label'].lower()}, queue, and intake summaries through FastAPI.",
-    ]
+    backend_features = _feature_list(required_features, idea)
 
     files = [
         {
             "name": "README.md",
             "kind": "markdown",
-            "summary": "Project overview, setup, and demo path.",
-            "content": _readme(project_title, idea, selected_stack, warning_lines, domain, user_story),
+            "summary": "Project overview, setup, and walkthrough path.",
+            "content": _readme(project_title, idea, selected_stack, warning_lines),
         },
         {
             "name": "package.json",
@@ -125,34 +124,41 @@ def build_project_artifacts(
             ),
         },
         {
-            "name": "src/api.js",
-            "kind": "javascript",
-            "summary": "Small API client for the generated FastAPI backend.",
-            "content": _api_client(),
-        },
-        {
             "name": "src/App.jsx",
             "kind": "javascript",
             "summary": "Runnable MVP user interface.",
-            "content": _react_app(project_title, idea, feature_label, backend_features, plan_steps, domain, user_story),
+            "content": _react_app(
+                project_title,
+                idea,
+                feature_label,
+                backend_features,
+                plan_steps,
+                audience,
+            ),
+        },
+        {
+            "name": "src/data/mockRecords.js",
+            "kind": "javascript",
+            "summary": "Realistic, labeled mock records for unavailable integrations.",
+            "content": _mock_records(project_title, idea, backend_features),
         },
         {
             "name": "src/styles.css",
             "kind": "css",
-            "summary": "Polished demo styling.",
+            "summary": "Polished MVP styling.",
             "content": _css(project_title),
         },
         {
             "name": "backend/main.py",
             "kind": "python",
             "summary": "FastAPI backend with MVP planning endpoints.",
-            "content": _backend_main(project_title, idea, backend_features, domain),
+            "content": _backend_main(project_title, idea, backend_features),
         },
         {
             "name": "backend/mvp_engine.py",
             "kind": "python",
             "summary": "Domain logic for the generated MVP.",
-            "content": _backend_engine(project_title, idea, backend_features, domain, plan_steps),
+            "content": _backend_engine(project_title, idea, backend_features, audience),
         },
         {
             "name": "requirements.txt",
@@ -176,7 +182,7 @@ def build_project_artifacts(
             "name": "docs/ARCHITECTURE.md",
             "kind": "markdown",
             "summary": "Architecture notes from the orchestrator plan.",
-            "content": _architecture(project_title, idea, selected_stack, plan_steps, warning_lines, domain),
+            "content": _architecture(project_title, idea, selected_stack, plan_steps, warning_lines),
         },
         {
             "name": "docs/IMPLEMENTATION_PLAN.md",
@@ -193,14 +199,18 @@ def build_project_artifacts(
         {
             "name": "demo/demo_script.md",
             "kind": "markdown",
-            "summary": "Demo walkthrough for judges.",
-            "content": _demo_script(project_title, idea, feature_label, domain),
+            "summary": "Walkthrough for judges.",
+            "content": _demo_script(project_title, idea, feature_label),
         },
         {
             "name": ".env.example",
             "kind": "text",
             "summary": "Safe placeholder environment file.",
-            "content": "VITE_API_BASE_URL=http://127.0.0.1:8000\nDATABASE_URL=\n",
+            "content": (
+                "VITE_API_BASE_URL=http://127.0.0.1:8000\n"
+                "DATABASE_URL=postgresql://postgres:postgres@localhost:5432/mvp\n"
+                f"# Generated for: {project_title}\n"
+            ),
         },
     ]
     return files
@@ -214,17 +224,13 @@ def merge_with_project_artifacts(
     resolved_stack: str,
     repo_plan: dict[str, Any] | None = None,
     source_warnings: list[dict[str, str]] | None = None,
+    target_users: str | None = None,
+    required_features: list[str] | None = None,
+    tech_stack_preference: str | None = None,
 ) -> list[dict[str, Any]]:
-    """Preserve model-authored files while filling any gaps required for a real repo."""
+    """Model-authored files win; only fill missing health-check paths with idea-specific stubs."""
 
-    generated = build_project_artifacts(
-        idea=idea,
-        title=title,
-        resolved_stack=resolved_stack,
-        repo_plan=repo_plan,
-        source_warnings=source_warnings,
-    )
-    merged: dict[str, dict[str, Any]] = {artifact["name"]: artifact for artifact in generated}
+    merged: dict[str, dict[str, Any]] = {}
     for artifact in artifacts:
         name = str(artifact.get("name") or "").strip()
         if not name or name.endswith("/") or name.split("/")[-1] == ".env":
@@ -238,33 +244,35 @@ def merge_with_project_artifacts(
             "summary": str(artifact.get("summary") or "Generated by Nemotron."),
             "content": content if isinstance(content, str) else json.dumps(content, indent=2),
         }
+
+    gap_fill = build_project_artifacts(
+        idea=idea,
+        title=title,
+        resolved_stack=resolved_stack,
+        repo_plan=repo_plan,
+        source_warnings=source_warnings,
+        target_users=target_users,
+        required_features=required_features,
+        tech_stack_preference=tech_stack_preference,
+    )
+    for artifact in gap_fill:
+        name = artifact["name"]
+        if name not in merged:
+            merged[name] = artifact
     return [merged[path] for path in sorted(merged)]
 
 
-def _readme(
-    project_title: str,
-    idea: str,
-    selected_stack: str,
-    warnings: list[str],
-    domain: dict[str, Any],
-    user_story: str,
-) -> str:
+def _readme(project_title: str, idea: str, selected_stack: str, warnings: list[str]) -> str:
     warning_section = _markdown_list("Source Warnings", warnings)
     return (
         f"# {project_title}\n\n"
         f"{idea}\n\n"
-        f"{user_story}\n\n"
         "## MVP Workflow\n\n"
-        f"1. Capture a {domain['record_label'].lower()} intake with owner, segment, priority, and deadline.\n"
-        f"2. Convert the intake into a {domain['workflow_label'].lower()} queue item with next actions.\n"
-        f"3. Show {domain['metric_label'].lower()}, active work, and blocked items in the browser.\n"
-        "4. Serve the same demo data from FastAPI endpoints.\n"
-        "5. Keep a database schema ready for persistence without storing secrets.\n\n"
-        "## Demo Data Included\n\n"
-        f"- Sample audience: {domain['audience']}.\n"
-        f"- Primary record: {domain['record_label']}.\n"
-        f"- Default owner: {domain['owner']}.\n"
-        f"- First workflow state: {domain['workflow'][0]}.\n\n"
+        "1. Capture the user's messy intake.\n"
+        "2. Turn the intake into a prioritized action plan.\n"
+        "3. Show the current work queue in the browser.\n"
+        "4. Serve the same plan from a FastAPI backend.\n"
+        "5. Keep a database schema ready for persistence.\n\n"
         "## Stack\n\n"
         f"{selected_stack}\n\n"
         "## Run Locally\n\n"
@@ -291,186 +299,77 @@ def _react_app(
     feature_label: str,
     backend_features: list[str],
     plan_steps: list[str],
-    domain: dict[str, Any],
-    user_story: str,
+    audience: str,
 ) -> str:
-    demo_data = _demo_data(project_title, idea, backend_features, domain, plan_steps)
-    return (
-        "import { useMemo, useState } from 'react';\n\n"
-        "import { submitIntake } from './api.js';\n\n"
-        "const idea = " + json.dumps(idea) + ";\n"
-        "const userStory = " + json.dumps(user_story) + ";\n"
-        "const cards = " + json.dumps(backend_features, indent=2) + ";\n"
-        "const planSteps = " + json.dumps(plan_steps, indent=2) + ";\n\n"
-        "const demo = " + json.dumps(demo_data, indent=2) + ";\n\n"
-        "export default function App() {\n"
-        "  const [intake, setIntake] = useState(demo.intake_template);\n"
-        "  const [queue, setQueue] = useState(demo.queue);\n"
-        "  const [submitState, setSubmitState] = useState({ status: 'idle', message: 'Ready to queue a new item.' });\n"
-        "  const preview = useMemo(() => ({\n"
-        "    summary: intake.goal || demo.intake_template.goal,\n"
-        "    owner: intake.owner,\n"
-        "    priority: intake.priority,\n"
-        "    segment: intake.segment,\n"
-        "    recommended_next_step: demo.next_actions[0],\n"
-        "  }), [intake]);\n\n"
-        "  function updateIntake(event) {\n"
-        "    const { name, value } = event.target;\n"
-        "    setIntake((current) => ({ ...current, [name]: value }));\n"
-        "  }\n\n"
-        "  async function queueIntake() {\n"
-        "    setSubmitState({ status: 'saving', message: 'Submitting intake...' });\n"
-        "    const result = await submitIntake(intake);\n"
-        "    const queuedItem = {\n"
-        "      id: `item-${Date.now()}`,\n"
-        "      title: result.summary || intake.goal,\n"
-        "      segment: result.segment || intake.segment,\n"
-        "      owner: result.owner || intake.owner,\n"
-        "      priority: result.priority === 'high' ? 'High' : intake.priority,\n"
-        "      status: result.status || demo.workflow[0],\n"
-        "      due: 'new',\n"
-        "    };\n"
-        "    setQueue((current) => [queuedItem, ...current]);\n"
-        "    setSubmitState({\n"
-        "      status: result.offline ? 'offline' : 'saved',\n"
-        "      message: result.offline ? 'Queued locally. Start the FastAPI backend to persist responses.' : 'Queued through the API.',\n"
-        "    });\n"
-        "  }\n\n"
-        "  return (\n"
-        "    <main className=\"shell\">\n"
-        "      <section className=\"hero\">\n"
-        "        <div>\n"
-        "          <p className=\"eyebrow\">Generated MVP</p>\n"
-        f"          <h1>{_jsx_escape(project_title)}</h1>\n"
-        "          <p className=\"lede\">{idea}</p>\n"
-        "          <p className=\"story\">{userStory}</p>\n"
-        "        </div>\n"
-        "        <div className=\"statusPanel\" aria-label=\"MVP status\">\n"
-        "          <span className=\"statusDot\" />\n"
-        f"          <strong>{_jsx_escape(feature_label)} workflow ready</strong>\n"
-        "          <small>{demo.audience} can review live queue state, submit a realistic intake, and inspect matching API payloads.</small>\n"
-        "        </div>\n"
-        "      </section>\n\n"
-        "      <section className=\"metrics\" aria-label=\"Demo metrics\">\n"
-        "        {demo.metrics.map((metric) => (\n"
-        "          <article className=\"metric\" key={metric.label}>\n"
-        "            <span>{metric.label}</span>\n"
-        "            <strong>{metric.value}</strong>\n"
-        "            <small>{metric.delta}</small>\n"
-        "          </article>\n"
-        "        ))}\n"
-        "      </section>\n\n"
-        "      <section className=\"grid\" aria-label=\"Core MVP features\">\n"
-        "        {cards.map((card, index) => (\n"
-        "          <article className=\"card\" key={card}>\n"
-        "            <span>{String(index + 1).padStart(2, '0')}</span>\n"
-        "            <p>{card}</p>\n"
-        "          </article>\n"
-        "        ))}\n"
-        "      </section>\n\n"
-        "      <section className=\"agentTeam\" aria-label=\"Generated agent team\">\n"
-        "        <div className=\"sectionHeader\">\n"
-        "          <p className=\"eyebrow\">Agent team</p>\n"
-        "          <h2>Specialized subagents</h2>\n"
-        "        </div>\n"
-        "        <div className=\"agentGrid\">\n"
-        "          {demo.agent_team.map((agent) => (\n"
-        "            <article className=\"agentCard\" key={agent.name}>\n"
-        "              <div><strong>{agent.name}</strong><small>{agent.role}</small></div>\n"
-        "              <p>{agent.output}</p>\n"
-        "              <span>{agent.status}</span>\n"
-        "            </article>\n"
-        "          ))}\n"
-        "        </div>\n"
-        "      </section>\n\n"
-        "      <section className=\"workspace\" aria-label=\"MVP workspace\">\n"
-        "        <form className=\"panel\" onSubmit={(event) => { event.preventDefault(); queueIntake(); }}>\n"
-        "          <div className=\"sectionHeader\">\n"
-        "            <p className=\"eyebrow\">Intake</p>\n"
-        "            <h2>{demo.record_label}</h2>\n"
-        "          </div>\n"
-        "          <label>Goal<input name=\"goal\" value={intake.goal} onChange={updateIntake} /></label>\n"
-        "          <label>Segment<input name=\"segment\" value={intake.segment} onChange={updateIntake} /></label>\n"
-        "          <div className=\"fieldRow\">\n"
-        "            <label>Priority<select name=\"priority\" value={intake.priority} onChange={updateIntake}><option>High</option><option>Normal</option><option>Low</option></select></label>\n"
-        "            <label>Owner<input name=\"owner\" value={intake.owner} onChange={updateIntake} /></label>\n"
-        "          </div>\n"
-        "          <button type=\"submit\" disabled={submitState.status === 'saving'}>{submitState.status === 'saving' ? 'Queueing...' : 'Queue intake'}</button>\n"
-        "          <small className={`submitState ${submitState.status}`}>{submitState.message}</small>\n"
-        "        </form>\n\n"
-        "        <section className=\"panel\">\n"
-        "          <div className=\"sectionHeader\">\n"
-        "            <p className=\"eyebrow\">Workflow</p>\n"
-        "            <h2>{demo.workflow_label}</h2>\n"
-        "          </div>\n"
-        "          <div className=\"queueList\">\n"
-        "            {queue.map((item) => (\n"
-        "              <article className=\"queueItem\" key={item.id}>\n"
-        "                <div><strong>{item.title}</strong><small>{item.segment} - {item.owner}</small></div>\n"
-        "                <span className={`pill ${item.priority.toLowerCase()}`}>{item.priority}</span>\n"
-        "                <small>{item.status} by {item.due}</small>\n"
-        "              </article>\n"
-        "            ))}\n"
-        "          </div>\n"
-        "        </section>\n"
-        "      </section>\n\n"
-        "      <section className=\"workspace lower\" aria-label=\"Plan and API preview\">\n"
-        "        <section className=\"panel\">\n"
-        "          <div className=\"sectionHeader\">\n"
-        "            <p className=\"eyebrow\">Build plan</p>\n"
-        "            <h2>Actionable next steps</h2>\n"
-        "          </div>\n"
-        "          <ol className=\"planList\">\n"
-        "            {planSteps.map((step) => <li key={step}>{step}</li>)}\n"
-        "          </ol>\n"
-        "        </section>\n"
-        "        <section className=\"panel apiPanel\">\n"
-        "          <div className=\"sectionHeader\">\n"
-        "            <p className=\"eyebrow\">API preview</p>\n"
-        "            <h2>/api/intake</h2>\n"
-        "          </div>\n"
-        "          <pre>{JSON.stringify(preview, null, 2)}</pre>\n"
-        "        </section>\n"
-        "      </section>\n"
-        "    </main>\n"
-        "  );\n"
-        "}\n"
-    )
-
-
-def _api_client() -> str:
-    return (
-        "const API_BASE_URL = import.meta.env.VITE_API_BASE_URL || 'http://127.0.0.1:8000';\n\n"
-        "export async function submitIntake(intake) {\n"
-        "  const payload = {\n"
-        "    user_goal: intake.goal,\n"
-        "    urgency: intake.priority,\n"
-        "    segment: intake.segment,\n"
-        "    owner: intake.owner,\n"
-        "  };\n\n"
-        "  try {\n"
-        "    const response = await fetch(`${API_BASE_URL}/api/intake`, {\n"
-        "      method: 'POST',\n"
-        "      headers: { 'Content-Type': 'application/json' },\n"
-        "      body: JSON.stringify(payload),\n"
-        "    });\n"
-        "    if (!response.ok) {\n"
-        "      throw new Error(`API returned ${response.status}`);\n"
-        "    }\n"
-        "    return await response.json();\n"
-        "  } catch (error) {\n"
-        "    return {\n"
-        "      summary: intake.goal,\n"
-        "      priority: intake.priority.toLowerCase(),\n"
-        "      segment: intake.segment,\n"
-        "      owner: intake.owner,\n"
-        "      status: 'Needs review',\n"
-        "      offline: true,\n"
-        "      error: error instanceof Error ? error.message : 'API unavailable',\n"
-        "    };\n"
-        "  }\n"
-        "}\n"
-    )
+    lines = [
+        "import { useMemo, useState } from 'react';",
+        "import { mockRecords } from './data/mockRecords.js';",
+        "",
+        "const idea = " + json.dumps(idea) + ";",
+        "const audience = " + json.dumps(audience) + ";",
+        "const cards = " + json.dumps(backend_features, indent=2) + ";",
+        "const planSteps = " + json.dumps(plan_steps, indent=2) + ";",
+        "const tabs = ['Dashboard', 'Intake', 'Roadmap'];",
+        "",
+        "export default function App() {",
+        "  const [activeTab, setActiveTab] = useState('Dashboard');",
+        "  const [goal, setGoal] = useState('');",
+        "  const [urgency, setUrgency] = useState('normal');",
+        "  const [intakeResult, setIntakeResult] = useState(null);",
+        "  const metrics = useMemo(() => ({",
+        "    open: mockRecords.filter((item) => item.status !== 'done').length,",
+        "    done: mockRecords.filter((item) => item.status === 'done').length,",
+        "  }), []);",
+        "",
+        "  async function submitIntake(event) {",
+        "    event.preventDefault();",
+        "    const response = await fetch('/api/intake', {",
+        "      method: 'POST',",
+        "      headers: { 'Content-Type': 'application/json' },",
+        "      body: JSON.stringify({ user_goal: goal, urgency, notes: idea }),",
+        "    });",
+        "    setIntakeResult(await response.json());",
+        "  }",
+        "",
+        "  return (",
+        '    <main className="shell">',
+        '      <header className="topbar">',
+        "        <div><p className=\"eyebrow\">MVPilot Autonomous Build</p><h1>" + _jsx_escape(project_title) + "</h1></div>",
+        '        <nav className="tabs">{tabs.map((tab) => (',
+        "          <button key={tab} type=\"button\" className={activeTab === tab ? 'tab active' : 'tab'} onClick={() => setActiveTab(tab)}>{tab}</button>",
+        "        ))}</nav>",
+        "      </header>",
+        '      <section className="hero">',
+        '        <div><p className="lede">{idea}</p><p className="meta">Built for <strong>{audience}</strong></p></div>',
+        '        <div className="statusPanel"><span className="statusDot" /><strong>' + _jsx_escape(feature_label) + ' prototype ready</strong><small>Multi-page UI, API, mock data, tests, docs.</small></div>',
+        "      </section>",
+        "      {activeTab === 'Dashboard' && (",
+        '        <section className="dashboard">',
+        '          <article className="metric"><span>Open</span><strong>{metrics.open}</strong></article>',
+        '          <article className="metric"><span>Done</span><strong>{metrics.done}</strong></article>',
+        '          <article className="metric"><span>Features</span><strong>{cards.length}</strong></article>',
+        '          <div className="table">{mockRecords.map((row) => (',
+        '            <div className="tableRow" key={row.id}><span>{row.owner}</span><span>{row.title}</span><span className={`pill ${row.status}`}>{row.status}</span></div>',
+        "          ))}</div>",
+        "        </section>",
+        "      )}",
+        "      {activeTab === 'Intake' && (",
+        '        <section className="intake"><form onSubmit={submitIntake}>',
+        '          <label>Goal</label><textarea value={goal} onChange={(e) => setGoal(e.target.value)} rows={4} required />',
+        '          <label>Urgency</label><select value={urgency} onChange={(e) => setUrgency(e.target.value)}><option value="normal">Normal</option><option value="high">High</option><option value="urgent">Urgent</option></select>',
+        '          <button type="submit">Submit intake</button></form>',
+        '          {intakeResult && <article className="result"><h3>Backend response</h3><p>{intakeResult.summary}</p><p>{intakeResult.recommended_first_step}</p></article>}',
+        "        </section>",
+        "      )}",
+        "      {activeTab === 'Roadmap' && (",
+        '        <section className="grid">{cards.map((card, index) => (<article className="card" key={card}><span>{String(index + 1).padStart(2, \\"0\\")}</span><p>{card}</p></article>))}',
+        '          <section className="plan"><h2>Plan</h2><ol>{planSteps.map((step) => <li key={step}>{step}</li>)}</ol></section></section>',
+        "      )}",
+        "    </main>",
+        "  );",
+        "}",
+    ]
+    return "\n".join(lines) + "\n"
 
 
 def _css(project_title: str) -> str:
@@ -478,97 +377,70 @@ def _css(project_title: str) -> str:
     return (
         ":root {\n"
         "  color: #172026;\n"
-        "  background: #f4f7f9;\n"
+        "  background: #f6f8fb;\n"
         "  font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;\n"
         "}\n\n"
         "* { box-sizing: border-box; }\n"
         "body { margin: 0; }\n"
-        "button, input, select { font: inherit; }\n"
-        ".shell { min-height: 100vh; padding: 40px; max-width: 1280px; margin: 0 auto; }\n"
+        ".shell { min-height: 100vh; padding: 48px; }\n"
         ".hero { display: grid; grid-template-columns: minmax(0, 1.4fr) minmax(280px, 0.6fr); gap: 32px; align-items: stretch; }\n"
-        ".eyebrow { color: #0f766e; font-weight: 800; letter-spacing: 0; text-transform: uppercase; font-size: 12px; margin: 0; }\n"
-        "h1 { margin: 8px 0 16px; font-size: 48px; line-height: 1.05; letter-spacing: 0; }\n"
-        "h2 { margin: 4px 0 0; font-size: 22px; }\n"
-        ".lede { max-width: 780px; font-size: 20px; line-height: 1.55; color: #42515a; }\n"
-        ".story { max-width: 760px; color: #60717d; line-height: 1.6; }\n"
-        ".statusPanel, .card, .metric, .panel { border: 1px solid #d7dee8; background: #ffffff; border-radius: 8px; box-shadow: 0 16px 40px rgba(27, 39, 51, 0.07); }\n"
+        ".eyebrow { color: #0f766e; font-weight: 800; letter-spacing: 0.12em; text-transform: uppercase; font-size: 12px; }\n"
+        "h1 { margin: 8px 0 16px; font-size: 52px; line-height: 1; letter-spacing: 0; }\n"
+        ".lede { max-width: 760px; font-size: 20px; line-height: 1.6; color: #42515a; }\n"
+        ".statusPanel, .card, .plan { border: 1px solid #d7dee8; background: #ffffff; border-radius: 8px; box-shadow: 0 18px 50px rgba(27, 39, 51, 0.08); }\n"
         ".statusPanel { padding: 24px; display: grid; align-content: center; gap: 10px; }\n"
         ".statusDot { width: 12px; height: 12px; border-radius: 999px; background: #16a34a; box-shadow: 0 0 0 6px rgba(22, 163, 74, 0.12); }\n"
         ".statusPanel small { color: #60717d; line-height: 1.5; }\n"
-        ".metrics { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 14px; margin-top: 32px; }\n"
-        ".metric { padding: 18px; display: grid; gap: 8px; min-height: 120px; }\n"
-        ".metric span, .metric small { color: #60717d; }\n"
-        ".metric strong { font-size: 30px; }\n"
         ".grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 16px; margin-top: 32px; }\n"
         ".card { padding: 22px; min-height: 150px; }\n"
         ".card span { color: #0f766e; font-weight: 900; font-size: 12px; }\n"
         ".card p { font-size: 17px; line-height: 1.55; margin-bottom: 0; }\n"
-        ".agentTeam { margin-top: 32px; }\n"
-        ".agentGrid { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 12px; }\n"
-        ".agentCard { border: 1px solid #d7dee8; background: #ffffff; border-radius: 8px; padding: 16px; min-height: 180px; display: grid; align-content: space-between; gap: 12px; box-shadow: 0 14px 34px rgba(27, 39, 51, 0.06); }\n"
-        ".agentCard strong { display: block; font-size: 15px; }\n"
-        ".agentCard small, .agentCard p { color: #60717d; line-height: 1.45; }\n"
-        ".agentCard p { margin: 0; font-size: 14px; }\n"
-        ".agentCard span { justify-self: start; border-radius: 999px; padding: 5px 9px; background: #ecfdf5; color: #047857; font-size: 12px; font-weight: 800; }\n"
-        ".workspace { display: grid; grid-template-columns: minmax(320px, 0.8fr) minmax(0, 1.2fr); gap: 20px; margin-top: 32px; align-items: start; }\n"
-        ".workspace.lower { grid-template-columns: minmax(0, 1fr) minmax(320px, 0.75fr); }\n"
-        ".panel { padding: 24px; }\n"
-        ".sectionHeader { margin-bottom: 18px; }\n"
-        "label { display: grid; gap: 8px; color: #42515a; font-weight: 700; margin-top: 14px; }\n"
-        "input, select { width: 100%; border: 1px solid #cbd5df; border-radius: 6px; padding: 11px 12px; color: #172026; background: #fbfcfe; }\n"
-        ".fieldRow { display: grid; grid-template-columns: 0.7fr 1fr; gap: 12px; }\n"
-        "button { margin-top: 18px; border: 0; border-radius: 6px; padding: 12px 16px; background: #0f766e; color: #ffffff; font-weight: 800; cursor: pointer; }\n"
-        "button:disabled { cursor: wait; opacity: 0.7; }\n"
-        ".submitState { display: block; margin-top: 10px; color: #60717d; }\n"
-        ".submitState.saved { color: #047857; }\n"
-        ".submitState.offline { color: #92400e; }\n"
-        ".queueList { display: grid; gap: 12px; }\n"
-        ".queueItem { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 10px; padding: 14px; border: 1px solid #e2e8f0; border-radius: 8px; background: #fbfcfe; }\n"
-        ".queueItem small { color: #60717d; display: block; margin-top: 4px; }\n"
-        ".pill { border-radius: 999px; padding: 5px 9px; background: #e8f5f3; color: #0f766e; font-size: 12px; font-weight: 800; align-self: start; }\n"
-        ".pill.high { background: #fee2e2; color: #991b1b; }\n"
-        ".pill.low { background: #eef2ff; color: #3730a3; }\n"
-        ".planList { margin: 0; padding-left: 22px; }\n"
-        ".planList li { margin: 10px 0; color: #42515a; line-height: 1.6; }\n"
-        ".apiPanel pre { overflow: auto; margin: 0; padding: 16px; background: #162026; color: #d9f99d; border-radius: 8px; font-size: 13px; line-height: 1.5; }\n"
+        ".plan { margin-top: 32px; padding: 28px; }\n"
+        ".plan h2 { margin-top: 0; }\n"
+        ".plan li { margin: 10px 0; color: #42515a; line-height: 1.6; }\n"
+        ".topbar { display: flex; justify-content: space-between; align-items: flex-end; gap: 24px; margin-bottom: 24px; }\n"
+        ".tabs { display: flex; gap: 8px; flex-wrap: wrap; }\n"
+        ".tab { border: 1px solid #d7dee8; background: #fff; border-radius: 999px; padding: 8px 14px; cursor: pointer; font-weight: 700; }\n"
+        ".tab.active { background: #0f766e; color: #fff; border-color: #0f766e; }\n"
+        ".meta { color: #60717d; margin-top: 8px; }\n"
+        ".dashboard { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 16px; margin-top: 24px; }\n"
+        ".metric { padding: 20px; border: 1px solid #d7dee8; border-radius: 8px; background: #fff; }\n"
+        ".metric span { display: block; color: #60717d; font-size: 12px; text-transform: uppercase; letter-spacing: 0.08em; }\n"
+        ".metric strong { font-size: 32px; }\n"
+        ".table { grid-column: 1 / -1; border: 1px solid #d7dee8; border-radius: 8px; overflow: hidden; background: #fff; }\n"
+        ".tableRow { display: grid; grid-template-columns: 120px 1fr 120px; gap: 12px; padding: 14px 18px; border-top: 1px solid #eef2f6; }\n"
+        ".pill { text-transform: capitalize; font-weight: 700; font-size: 12px; }\n"
+        ".pill.done { color: #16a34a; }\n"
+        ".pill.active { color: #0f766e; }\n"
+        ".intake, .result { margin-top: 24px; padding: 24px; border: 1px solid #d7dee8; border-radius: 8px; background: #fff; }\n"
+        ".intake label { display: block; font-weight: 700; margin: 12px 0 6px; }\n"
+        ".intake textarea, .intake select, .intake button { width: 100%; margin-bottom: 12px; padding: 10px 12px; font: inherit; }\n"
+        ".intake button { background: #0f766e; color: #fff; border: 0; border-radius: 8px; font-weight: 700; cursor: pointer; }\n"
         "@media (max-width: 840px) {\n"
         "  .shell { padding: 24px; }\n"
-        "  .hero, .grid, .metrics, .agentGrid, .workspace, .workspace.lower, .fieldRow { grid-template-columns: 1fr; }\n"
+        "  .hero, .grid { grid-template-columns: 1fr; }\n"
         "  h1 { font-size: 38px; }\n"
         "}\n"
     )
 
 
-def _backend_main(project_title: str, idea: str, features: list[str], domain: dict[str, Any]) -> str:
+def _backend_main(project_title: str, idea: str, features: list[str]) -> str:
     return (
         '"""FastAPI surface for the generated MVP."""\n\n'
         "from fastapi import FastAPI\n"
-        "from fastapi.middleware.cors import CORSMiddleware\n"
         "from pydantic import BaseModel\n\n"
-        "from backend.mvp_engine import build_demo_plan, build_demo_workspace, summarize_intake\n\n\n"
+        "from backend.mvp_engine import build_mvp_plan, summarize_intake\n\n\n"
         "app = FastAPI(title=" + json.dumps(project_title) + ")\n\n\n"
-        "app.add_middleware(\n"
-        "    CORSMiddleware,\n"
-        "    allow_origins=['http://localhost:5173', 'http://127.0.0.1:5173'],\n"
-        "    allow_credentials=True,\n"
-        "    allow_methods=['*'],\n"
-        "    allow_headers=['*'],\n"
-        ")\n\n\n"
         "class Intake(BaseModel):\n"
         "    user_goal: str\n"
         "    urgency: str = 'normal'\n"
-        "    segment: str = " + json.dumps(domain["audience"]) + "\n"
-        "    owner: str = " + json.dumps(domain["owner"]) + "\n"
         "    notes: str | None = None\n\n\n"
         "@app.get('/health')\n"
         "def health() -> dict[str, str]:\n"
         "    return {'status': 'ok', 'service': " + json.dumps(project_title) + "}\n\n\n"
-        "@app.get('/api/demo-data')\n"
-        "def demo_data() -> dict[str, object]:\n"
-        "    return build_demo_workspace()\n\n\n"
-        "@app.get('/api/demo-plan')\n"
-        "def demo_plan() -> dict[str, object]:\n"
-        "    return build_demo_plan(" + json.dumps(idea) + ", " + json.dumps(features) + ")\n\n\n"
+        "@app.get('/api/mvp-plan')\n"
+        "def mvp_plan() -> dict[str, object]:\n"
+        "    return build_mvp_plan(" + json.dumps(idea) + ", " + json.dumps(features) + ")\n\n\n"
         "@app.post('/api/intake')\n"
         "def intake(payload: Intake) -> dict[str, object]:\n"
         "    return summarize_intake(payload.model_dump())\n"
@@ -579,58 +451,53 @@ def _backend_engine(
     project_title: str,
     idea: str,
     features: list[str],
-    domain: dict[str, Any],
-    plan_steps: list[str],
+    audience: str,
 ) -> str:
-    demo_data = _demo_data(project_title, idea, features, domain, plan_steps)
+    del project_title
     return (
         '"""Core MVP planning logic."""\n\n'
         "from __future__ import annotations\n\n"
         "from typing import Any\n\n\n"
-        "DEMO_WORKSPACE: dict[str, Any] = " + json.dumps(demo_data, indent=4) + "\n\n\n"
-        "def build_demo_workspace() -> dict[str, Any]:\n"
-        "    return DEMO_WORKSPACE\n\n\n"
-        "def build_demo_plan(idea: str, features: list[str]) -> dict[str, Any]:\n"
+        "MOCK_QUEUE = [\n"
+        "    {'id': 'wk-101', 'owner': 'Ops', 'title': 'Validate intake flow', 'status': 'active'},\n"
+        "    {'id': 'wk-102', 'owner': 'Product', 'title': 'Review generated plan', 'status': 'done'},\n"
+        "    {'id': 'wk-103', 'owner': 'Eng', 'title': 'Wire persistence', 'status': 'active'},\n"
+        "]\n\n\n"
+        "def build_mvp_plan(idea: str, features: list[str]) -> dict[str, Any]:\n"
         "    return {\n"
         "        'idea': idea,\n"
+        "        'audience': " + json.dumps(audience) + ",\n"
         "        'features': features,\n"
-        "        'audience': DEMO_WORKSPACE['audience'],\n"
-        "        'metrics': DEMO_WORKSPACE['metrics'],\n"
-        "        'agent_team': DEMO_WORKSPACE['agent_team'],\n"
-        "        'queue': DEMO_WORKSPACE['queue'],\n"
-        "        'next_actions': DEMO_WORKSPACE['next_actions'],\n"
+        "        'queue': MOCK_QUEUE,\n"
+        "        'next_actions': [\n"
+        "            'Validate the highest-risk user workflow.',\n"
+        "            'Review generated data model before wiring persistence.',\n"
+        "            'Run the MVP with one realistic intake.',\n"
+        "        ],\n"
         "    }\n\n\n"
         "def summarize_intake(payload: dict[str, Any]) -> dict[str, Any]:\n"
         "    goal = str(payload.get('user_goal') or '').strip()\n"
         "    urgency = str(payload.get('urgency') or 'normal').strip().lower()\n"
-        "    segment = str(payload.get('segment') or DEMO_WORKSPACE['audience']).strip()\n"
-        "    owner = str(payload.get('owner') or DEMO_WORKSPACE['intake_template']['owner']).strip()\n"
         "    priority = 'high' if urgency in {'urgent', 'high', 'critical'} else 'normal'\n"
-        "    first_action = DEMO_WORKSPACE['next_actions'][0]\n"
         "    return {\n"
         "        'summary': goal or " + json.dumps(idea) + ",\n"
         "        'priority': priority,\n"
-        "        'segment': segment,\n"
-        "        'owner': owner,\n"
-        "        'status': DEMO_WORKSPACE['workflow'][0],\n"
-        "        'recommended_first_step': first_action,\n"
+        "        'recommended_first_step': 'Create the first tracked work item.',\n"
         "    }\n"
     )
 
 
 def _backend_test(project_title: str) -> str:
     return (
-        "from backend.mvp_engine import build_demo_plan, summarize_intake\n\n\n"
-        "def test_demo_plan_contains_features():\n"
-        "    plan = build_demo_plan('demo idea', ['capture intake'])\n"
-        "    assert plan['idea'] == 'demo idea'\n"
-        "    assert plan['features'] == ['capture intake']\n"
-        "    assert plan['queue']\n\n\n"
+        "from backend.mvp_engine import build_mvp_plan, summarize_intake\n\n\n"
+        "def test_mvp_plan_contains_features():\n"
+        "    plan = build_mvp_plan(" + json.dumps(project_title) + ", ['capture intake'])\n"
+        "    assert plan['idea'] == " + json.dumps(project_title) + "\n"
+        "    assert plan['features'] == ['capture intake']\n\n\n"
         "def test_intake_marks_urgent_items_high_priority():\n"
         "    result = summarize_intake({'user_goal': 'ship it', 'urgency': 'urgent'})\n"
         "    assert result['priority'] == 'high'\n"
         "    assert 'ship it' in result['summary']\n"
-        "    assert result['recommended_first_step']\n"
         f"    assert {json.dumps(project_title)}\n"
     )
 
@@ -643,17 +510,12 @@ def _database_schema(project_slug: str) -> str:
         "  id uuid primary key default gen_random_uuid(),\n"
         "  user_goal text not null,\n"
         "  urgency text not null default 'normal',\n"
-        "  segment text not null default 'general',\n"
-        "  owner_name text,\n"
-        "  due_label text,\n"
         "  notes text,\n"
         "  status text not null default 'new',\n"
         "  created_at timestamptz not null default now()\n"
         ");\n\n"
         f"create index if not exists {table_prefix}_intakes_status_idx\n"
         f"  on {table_prefix}_intakes(status, created_at desc);\n"
-        f"create index if not exists {table_prefix}_intakes_owner_idx\n"
-        f"  on {table_prefix}_intakes(owner_name, urgency);\n"
     )
 
 
@@ -663,27 +525,16 @@ def _architecture(
     selected_stack: str,
     plan_steps: list[str],
     warnings: list[str],
-    domain: dict[str, Any],
 ) -> str:
     warning_section = _markdown_list("Source Warnings", warnings)
     return (
         f"# {project_title} Architecture\n\n"
         f"Original idea: {idea}\n\n"
         "## Components\n\n"
-        "- React frontend in `src/` for the demo workflow.\n"
-        f"- FastAPI backend in `backend/` for health, planning, {domain['record_label'].lower()} intake, and demo data endpoints.\n"
+        "- React frontend in `src/` for the primary MVP workflow.\n"
+        "- FastAPI backend in `backend/` for health, planning, and intake endpoints.\n"
         "- Postgres schema in `docs/DATABASE_SCHEMA.sql` for the first persistence pass.\n"
         "- Pytest smoke tests in `tests/` for generated backend logic.\n\n"
-        "## Demo Domain\n\n"
-        f"- Audience: {domain['audience']}.\n"
-        f"- Workflow: {', '.join(domain['workflow'])}.\n"
-        f"- Metrics: {domain['metric_label']}.\n\n"
-        "## Generated Subagents\n\n"
-        "- Strategist Agent scopes the demo and selects the success metric.\n"
-        "- Research Agent turns source context into constraints and warnings.\n"
-        "- Builder Agent produces the frontend/API/database slice.\n"
-        "- QA Agent checks risks, blocked work, and demo readiness.\n"
-        "- Demo Agent packages the walkthrough for stakeholders.\n\n"
         "## Stack Decision\n\n"
         f"{selected_stack}\n\n"
         "## Implementation Steps\n\n"
@@ -715,7 +566,7 @@ def _build_log(
         "- Nemotron/OpenClaw orchestrator scoped the messy idea into one MVP.\n"
         "- RAG context and submitted sources were checked before planning.\n"
         f"- Selected stack: {selected_stack}.\n"
-        "- Generated frontend, backend, database schema, tests, docs, and demo script.\n\n"
+        "- Generated frontend, backend, database schema, tests, docs, and walkthrough script.\n\n"
         "## Plan Executed\n\n"
         + "\n".join(f"- {step}" for step in plan_steps)
         + "\n"
@@ -723,16 +574,14 @@ def _build_log(
     )
 
 
-def _demo_script(project_title: str, idea: str, feature_label: str, domain: dict[str, Any]) -> str:
+def _demo_script(project_title: str, idea: str, feature_label: str) -> str:
     return (
-        f"# {project_title} Demo Script\n\n"
+        f"# {project_title} Walkthrough Script\n\n"
         "1. Open the generated React app and introduce the user problem.\n"
-        f"2. Review the {domain['metric_label'].lower()} and active {feature_label.lower()} queue.\n"
-        "3. Explain how each generated subagent contributes one concrete output.\n"
-        f"4. Submit a realistic {domain['record_label'].lower()} intake for {domain['audience']}.\n"
-        "5. Show the FastAPI `/api/demo-data`, `/api/demo-plan`, and `/api/intake` responses.\n"
-        "6. Open `docs/DATABASE_SCHEMA.sql` to show persistence is ready.\n"
-        "7. Run `pytest` to show the generated backend logic has a smoke test.\n\n"
+        f"2. Submit a realistic {feature_label.lower()} intake.\n"
+        "3. Show the FastAPI `/api/mvp-plan` response.\n"
+        "4. Open `docs/DATABASE_SCHEMA.sql` to show persistence is ready.\n"
+        "5. Run `pytest` to show the generated backend logic has a smoke test.\n\n"
         f"Submitted idea: {idea}\n"
     )
 
@@ -748,7 +597,7 @@ def _plan_steps(repo_plan: dict[str, Any]) -> list[str]:
         "Generate the frontend screens for intake, status, and results.",
         "Generate backend endpoints for health, planning, and intake.",
         "Provide a Postgres schema for the first persistent data model.",
-        "Add tests and docs so the repo is demo-ready immediately.",
+        "Add tests and docs so the repo is presentation-ready immediately.",
     ]
 
 
@@ -776,174 +625,37 @@ def _markdown_list(title: str, lines: list[str]) -> str:
     return "\n\n## " + title + "\n\n" + "\n".join(f"- {line}" for line in lines) + "\n"
 
 
+def _feature_list(required_features: list[str] | None, idea: str) -> list[str]:
+    features = [str(item).strip() for item in (required_features or []) if str(item).strip()]
+    if features:
+        return features[:6]
+    label = _feature_label(idea)
+    return [
+        f"Capture {label.lower()} intake with structured fields.",
+        f"Prioritize the next actions for {label.lower()}.",
+        "Serve realistic mock records through the API and UI.",
+        "Document architecture, setup, and walkthrough steps.",
+    ]
+
+
+def _mock_records(project_title: str, idea: str, features: list[str]) -> str:
+    records = [
+        {"id": "rec-1", "owner": "Alex", "title": features[0] if features else "Validate intake", "status": "active"},
+        {"id": "rec-2", "owner": "Jordan", "title": features[1] if len(features) > 1 else "Review plan", "status": "done"},
+        {"id": "rec-3", "owner": "Sam", "title": features[2] if len(features) > 2 else "Launch MVP release path", "status": "active"},
+    ]
+    return (
+        f"// Mock records for {json.dumps(project_title)}\n"
+        f"// Idea: {json.dumps(idea)}\n"
+        f"export const mockRecords = {json.dumps(records, indent=2)};\n"
+    )
+
+
 def _feature_label(idea: str) -> str:
     words = re.findall(r"[A-Za-z0-9]+", idea.lower())
     skip = {"build", "create", "make", "a", "an", "the", "that", "helps", "for", "with"}
     selected = [word for word in words if word not in skip][:3]
     return " ".join(selected).title() if selected else "MVP"
-
-
-def _domain_context(project_title: str, idea: str) -> dict[str, Any]:
-    text = f"{project_title} {idea}".lower()
-    if any(term in text for term in ("referral", "clinic", "patient", "care", "health")):
-        return {
-            "audience": "care coordinators",
-            "record_label": "Referral Request",
-            "workflow_label": "Care Coordination",
-            "metric_label": "Referral Metrics",
-            "owner": "Nina Patel",
-            "workflow": ["Needs triage", "Records requested", "Specialist scheduled", "Closed loop"],
-            "segments": ["Cardiology", "Imaging", "Physical therapy"],
-            "sample_titles": [
-                "Book cardiology follow-up after abnormal ECG",
-                "Collect imaging prior authorization details",
-                "Confirm post-discharge therapy availability",
-            ],
-        }
-    if any(term in text for term in ("study", "student", "school", "course", "learn")):
-        return {
-            "audience": "students and advisors",
-            "record_label": "Study Plan Request",
-            "workflow_label": "Learning Sprint",
-            "metric_label": "Progress Metrics",
-            "owner": "Avery Chen",
-            "workflow": ["Needs assessment", "Plan drafted", "Session booked", "Progress reviewed"],
-            "segments": ["Exam prep", "Project work", "Office hours"],
-            "sample_titles": [
-                "Schedule biology exam review plan",
-                "Break capstone project into weekly tasks",
-                "Prepare office-hours question queue",
-            ],
-        }
-    if any(term in text for term in ("sales", "crm", "lead", "pipeline", "customer")):
-        return {
-            "audience": "revenue teams",
-            "record_label": "Lead Intake",
-            "workflow_label": "Pipeline Follow-Up",
-            "metric_label": "Pipeline Metrics",
-            "owner": "Jordan Lee",
-            "workflow": ["Needs qualification", "Discovery booked", "Proposal drafted", "Won or archived"],
-            "segments": ["Enterprise", "Mid-market", "Expansion"],
-            "sample_titles": [
-                "Qualify inbound enterprise pilot request",
-                "Prepare expansion call with active customer",
-                "Draft proposal for mid-market buyer",
-            ],
-        }
-    if any(term in text for term in ("event", "venue", "booking", "ticket")):
-        return {
-            "audience": "event operators",
-            "record_label": "Event Request",
-            "workflow_label": "Event Operations",
-            "metric_label": "Booking Metrics",
-            "owner": "Mara Torres",
-            "workflow": ["Needs details", "Vendor hold", "Run-of-show drafted", "Ready for event"],
-            "segments": ["Corporate", "Community", "Private"],
-            "sample_titles": [
-                "Confirm catering hold for workshop",
-                "Collect AV requirements for keynote",
-                "Draft run-of-show for community night",
-            ],
-        }
-    return {
-        "audience": "operators",
-        "record_label": "Work Request",
-        "workflow_label": "Operations Queue",
-        "metric_label": "Operating Metrics",
-        "owner": "Sam Rivera",
-        "workflow": ["Needs review", "Ready to start", "In progress", "Done"],
-        "segments": ["High value", "At risk", "New request"],
-        "sample_titles": [
-            "Review highest-risk user workflow",
-            "Prepare stakeholder-ready pilot data",
-            "Close the loop on blocked task",
-        ],
-    }
-
-
-def _demo_data(
-    project_title: str,
-    idea: str,
-    features: list[str],
-    domain: dict[str, Any],
-    plan_steps: list[str],
-) -> dict[str, Any]:
-    queue = []
-    priorities = ["High", "Normal", "Low"]
-    due_dates = ["today", "tomorrow", "Friday"]
-    for index, title in enumerate(domain["sample_titles"]):
-        queue.append(
-            {
-                "id": f"item-{index + 1}",
-                "title": title,
-                "segment": domain["segments"][index % len(domain["segments"])],
-                "owner": domain["owner"] if index == 0 else ["Taylor Kim", "Morgan Diaz"][index - 1],
-                "priority": priorities[index],
-                "status": domain["workflow"][index],
-                "due": due_dates[index],
-            }
-        )
-    return {
-        "project": project_title,
-        "idea": idea,
-        "audience": domain["audience"],
-        "record_label": domain["record_label"],
-        "workflow_label": domain["workflow_label"],
-        "metric_label": domain["metric_label"],
-        "workflow": domain["workflow"],
-        "features": features,
-        "metrics": [
-            {"label": "Open items", "value": str(len(queue)), "delta": "2 need attention"},
-            {"label": "Response time", "value": "14m", "delta": "from intake to owner"},
-            {"label": "On track", "value": "82%", "delta": "target workflow health"},
-            {"label": "Blocked", "value": "1", "delta": "waiting on outside input"},
-        ],
-        "intake_template": {
-            "goal": queue[0]["title"],
-            "segment": queue[0]["segment"],
-            "priority": queue[0]["priority"],
-            "owner": domain["owner"],
-        },
-        "queue": queue,
-        "agent_team": [
-            {
-                "name": "Strategist Agent",
-                "role": "Scope and success metric",
-                "status": "Ready",
-                "output": f"Narrows {domain['workflow_label'].lower()} to one demo path for {domain['audience']}.",
-            },
-            {
-                "name": "Research Agent",
-                "role": "Context and constraints",
-                "status": "Ready",
-                "output": f"Tracks source warnings, domain rules, and {domain['record_label'].lower()} requirements.",
-            },
-            {
-                "name": "Builder Agent",
-                "role": "App and API",
-                "status": "Ready",
-                "output": "Generates the React workspace, FastAPI routes, and database-ready schema.",
-            },
-            {
-                "name": "QA Agent",
-                "role": "Risk checks",
-                "status": "Ready",
-                "output": "Checks queue states, blocked work, and smoke-test coverage before demo.",
-            },
-            {
-                "name": "Demo Agent",
-                "role": "Stakeholder narrative",
-                "status": "Ready",
-                "output": "Packages the walkthrough, API payload, and next implementation steps.",
-            },
-        ],
-        "next_actions": [
-            f"Assign an owner and deadline to the newest {domain['record_label'].lower()}.",
-            f"Move one item from {domain['workflow'][0].lower()} to {domain['workflow'][1].lower()}.",
-            "Review the API response with the frontend before adding persistence.",
-        ],
-        "implementation_steps": plan_steps,
-    }
 
 
 def _user_story(idea: str) -> str:

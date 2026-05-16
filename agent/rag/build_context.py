@@ -236,7 +236,7 @@ async def build_build_context_response(request: BuildContextRequest) -> BuildCon
     for category in _CATEGORY_FIELDS:
         if not response_items[category]:
             empty_categories.append(category)
-            response_items[category] = _fallback_items(category)
+            response_items[category] = _default_items(category)
 
     scope_warnings: list[ScopeWarningItem] = [
         ScopeWarningItem(item=item.item, reason=item.reason, source=item.source)
@@ -246,7 +246,7 @@ async def build_build_context_response(request: BuildContextRequest) -> BuildCon
         scope_warnings.extend(
             ScopeWarningItem(
                 item=item,
-                reason="Safe fallback because vector retrieval returned no evidence.",
+                reason="Default safety context used because vector retrieval returned no evidence.",
                 source="mvpilot_default_build_context",
             )
             for item in FALLBACK_SCOPE_WARNINGS
@@ -310,12 +310,12 @@ def _build_search_query(request: BuildContextRequest) -> str:
     return " ".join(part for part in parts if part).strip()
 
 
-def _fallback_items(category: BuildContextResponseCategory) -> list[BuildContextItem]:
+def _default_items(category: BuildContextResponseCategory) -> list[BuildContextItem]:
     return [
         BuildContextItem(
             item=item,
             priority="high",
-            reason="Safe MVPilot fallback used because RAG did not return this category.",
+            reason="Default MVPilot build context used because RAG did not return this category.",
             source="mvpilot_default_build_context",
         )
         for item in FALLBACK_BUILD_ITEMS[category]

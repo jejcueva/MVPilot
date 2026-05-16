@@ -11,6 +11,13 @@ def test_health_returns_mock_defaults_without_secret_values(monkeypatch):
         "OPENCLAW_API_KEY",
         "GITHUB_TOKEN",
         "GITHUB_OWNER",
+        "GITHUB_OAUTH_CLIENT_ID",
+        "GITHUB_OAUTH_CLIENT_SECRET",
+        "GITHUB_OAUTH_REDIRECT_URI",
+        "GITHUB_CLIENT_ID",
+        "GITHUB_CLIENT_SECRET",
+        "GITHUB_REDIRECT_URI",
+        "GITHUB_TOKEN_ENCRYPTION_KEY",
     ):
         monkeypatch.delenv(key, raising=False)
     app = create_app(settings=Settings(_env_file=None, adapter_mode="mock"))

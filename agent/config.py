@@ -26,8 +26,12 @@ class Settings(BaseSettings):
     )
 
     adapter_mode: Literal["mock", "live"] = Field(
-        default="mock",
+        default="live",
         validation_alias="ADAPTER_MODE",
+    )
+    allow_idea_aware_partial: bool = Field(
+        default=True,
+        validation_alias="ALLOW_IDEA_AWARE_PARTIAL",
     )
     mock_mode_override: bool | None = Field(
         default=None,

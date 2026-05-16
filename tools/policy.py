@@ -35,6 +35,31 @@ def repo_prefix() -> str:
     return os.getenv("GITHUB_REPO_PREFIX", DEFAULT_REPO_PREFIX)
 
 
+def repo_name_candidates(
+    repo_name: str | None,
+    *,
+    task_id: str | None = None,
+    max_candidates: int = 6,
+) -> list[str]:
+    """Return ordered repo names to try (base first, then unique suffixes)."""
+
+    base = normalize_generated_repo_name(repo_name, task_id=task_id)
+    candidates = [base]
+    slug = re.sub(r"[^a-z0-9]", "", (task_id or "").lower())[:6]
+    if slug:
+        tagged = f"{base}-{slug}"
+        if tagged not in candidates and len(tagged) <= 100 and _REPO_NAME_RE.fullmatch(tagged):
+            candidates.append(tagged)
+    for index in range(2, max_candidates + 1):
+        candidate = f"{base}-{index}"
+        if candidate in candidates:
+            continue
+        if len(candidate) > 100 or not _REPO_NAME_RE.fullmatch(candidate):
+            break
+        candidates.append(candidate)
+    return candidates
+
+
 def normalize_generated_repo_name(
     repo_name: str | None,
     *,
@@ -43,10 +68,10 @@ def normalize_generated_repo_name(
     """Ensure user-supplied names satisfy the generated-repo prefix policy."""
 
     prefix = repo_prefix()
-    fallback = f"{prefix}{(task_id or 'demo')[:8]}"
-    name = (repo_name or fallback).strip()
+    generated_default = f"{prefix}{(task_id or 'generated')[:8]}"
+    name = (repo_name or generated_default).strip()
     if not name:
-        return fallback
+        return generated_default
     if name.startswith(prefix):
         return name
     if name.startswith("mvpilot-") and not name.startswith(prefix):
@@ -54,7 +79,7 @@ def normalize_generated_repo_name(
     elif not name.startswith(prefix):
         name = f"{prefix}{name}"
     if not _REPO_NAME_RE.fullmatch(name):
-        return fallback
+        return generated_default
     return name
 
 

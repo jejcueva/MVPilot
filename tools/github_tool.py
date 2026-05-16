@@ -13,7 +13,13 @@ from urllib.request import Request, urlopen
 from pydantic import ValidationError
 
 from tools.http_ssl import default_ssl_context
-from tools.policy import repo_prefix, validate_action, validate_file_payloads, validate_github_mutation
+from tools.policy import (
+    repo_name_candidates,
+    repo_prefix,
+    validate_action,
+    validate_file_payloads,
+    validate_github_mutation,
+)
 from tools.schemas import CommitFilesRequest, CreateRepoRequest, ToolResult, safe_validation_errors
 from tools import mock_store
 
@@ -314,12 +320,35 @@ def check_github_auth(config: GitHubConfig | None = None) -> dict:
     ).model_dump(mode="json")
 
 
+def _github_http_code(exc: Exception) -> int | None:
+    message = str(exc)
+    if "GitHub API HTTP " not in message:
+        return None
+    try:
+        return int(message.split("GitHub API HTTP ", 1)[1].split(":", 1)[0])
+    except ValueError:
+        return None
+
+
+def _is_repo_not_found(exc: Exception) -> bool:
+    return _github_http_code(exc) == 404
+
+
+def _is_repo_name_conflict(exc: Exception) -> bool:
+    if _github_http_code(exc) != 422:
+        return False
+    lowered = str(exc).lower()
+    return "already exists" in lowered or "name already exists" in lowered
+
+
 def create_repo(
     repo_name: str,
     description: str,
     visibility: str,
     *,
     config: GitHubConfig | None = None,
+    task_id: str | None = None,
+    reuse_existing: bool = True,
 ) -> dict:
     """Create a generated GitHub repository and verify it by reading metadata."""
 
@@ -337,31 +366,85 @@ def create_repo(
         return policy_error.model_dump(mode="json")
 
     active_config = config or GitHubConfig.from_env()
-    if active_config.mock_tools or not active_config.token:
+    if active_config.mock_tools:
         return _mock_create_repo(request.repo_name, request.visibility).model_dump(mode="json")
+    if not active_config.token:
+        return ToolResult.failure(
+            "github.create_repo",
+            "GitHub OAuth token is required before MVPilot can create a repository.",
+            {
+                "repo_name": request.repo_name,
+                "authenticated": False,
+                "required_action": "Connect GitHub through OAuth and retry.",
+            },
+        ).model_dump(mode="json")
 
+    requested_name = request.repo_name
+    candidates = repo_name_candidates(requested_name, task_id=task_id)
     client = GitHubClient(active_config)
-    try:
-        created = client.create_user_repo(
-            request.repo_name,
-            request.description,
-            private=request.visibility == "private",
-        )
-        verified = client.get_repo(request.repo_name)
-    except Exception as exc:
-        return ToolResult.failure("github.create_repo", str(exc)).model_dump(mode="json")
+    last_error: Exception | None = None
 
-    return ToolResult.success(
+    for candidate in candidates:
+        policy_error = validate_github_mutation("create_repo", candidate)
+        if policy_error:
+            return policy_error.model_dump(mode="json")
+
+        if reuse_existing:
+            try:
+                verified = client.get_repo(candidate)
+            except Exception as exc:
+                if not _is_repo_not_found(exc):
+                    last_error = exc
+                    if _is_repo_name_conflict(exc):
+                        continue
+                    return ToolResult.failure("github.create_repo", str(exc)).model_dump(mode="json")
+            else:
+                return ToolResult.success(
+                    "github.create_repo",
+                    {
+                        "repo_name": candidate,
+                        "requested_repo_name": requested_name,
+                        "repo_url": verified.get("html_url"),
+                        "visibility": request.visibility,
+                        "status": "reused",
+                        "name_adjusted": candidate != requested_name,
+                        "verified_full_name": verified.get("full_name"),
+                    },
+                    verification_status="verified",
+                ).model_dump(mode="json")
+
+        try:
+            created = client.create_user_repo(
+                candidate,
+                request.description,
+                private=request.visibility == "private",
+            )
+            verified = client.get_repo(candidate)
+        except Exception as exc:
+            last_error = exc
+            if _is_repo_name_conflict(exc):
+                continue
+            return ToolResult.failure("github.create_repo", str(exc)).model_dump(mode="json")
+
+        return ToolResult.success(
+            "github.create_repo",
+            {
+                "repo_name": candidate,
+                "requested_repo_name": requested_name,
+                "repo_url": created.get("html_url") or verified.get("html_url"),
+                "visibility": request.visibility,
+                "status": "created",
+                "name_adjusted": candidate != requested_name,
+                "github_id": created.get("id"),
+                "verified_full_name": verified.get("full_name"),
+            },
+            verification_status="verified",
+        ).model_dump(mode="json")
+
+    detail = str(last_error) if last_error else "No available repository name."
+    return ToolResult.failure(
         "github.create_repo",
-        {
-            "repo_name": request.repo_name,
-            "repo_url": created.get("html_url") or verified.get("html_url"),
-            "visibility": request.visibility,
-            "status": "created",
-            "github_id": created.get("id"),
-            "verified_full_name": verified.get("full_name"),
-        },
-        verification_status="verified",
+        f"{detail} Tried: {', '.join(candidates)}.",
     ).model_dump(mode="json")
 
 
@@ -515,8 +598,18 @@ def commit_files(
         return policy_error.model_dump(mode="json")
 
     active_config = config or GitHubConfig.from_env()
-    if active_config.mock_tools or not active_config.token:
+    if active_config.mock_tools:
         return _mock_commit_files(request).model_dump(mode="json")
+    if not active_config.token:
+        return ToolResult.failure(
+            "github.commit_files",
+            "GitHub OAuth token is required before MVPilot can commit generated files.",
+            {
+                "repo_name": request.repo_name,
+                "authenticated": False,
+                "required_action": "Reconnect GitHub through OAuth and retry.",
+            },
+        ).model_dump(mode="json")
 
     client = GitHubClient(active_config)
     try:
