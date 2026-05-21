@@ -26,8 +26,31 @@ class Settings(BaseSettings):
     )
 
     adapter_mode: Literal["mock", "live"] = Field(
-        default="mock",
+        default="live",
         validation_alias="ADAPTER_MODE",
+    )
+    allow_idea_aware_partial: bool = Field(
+        default=False,
+        validation_alias=AliasChoices("ALLOW_DEGRADED_MODE", "ALLOW_IDEA_AWARE_PARTIAL"),
+    )
+    nemotron_fast_fallback: bool = Field(
+        default=False,
+        validation_alias="NEMOTRON_FAST_FALLBACK",
+    )
+    nemotron_live_attempt_timeout_seconds: float = Field(
+        default=75,
+        gt=0,
+        validation_alias="NEMOTRON_LIVE_ATTEMPT_TIMEOUT_SECONDS",
+    )
+    nemotron_fast_fallback_max_retries: int = Field(
+        default=0,
+        ge=0,
+        validation_alias="NEMOTRON_FAST_FALLBACK_MAX_RETRIES",
+    )
+    nemotron_fast_fallback_poll_max_seconds: float = Field(
+        default=90,
+        gt=0,
+        validation_alias="NEMOTRON_FAST_FALLBACK_POLL_MAX_SECONDS",
     )
     mock_mode_override: bool | None = Field(
         default=None,
@@ -35,7 +58,7 @@ class Settings(BaseSettings):
     )
     nvidia_api_key: SecretStr | None = Field(
         default=None,
-        validation_alias="NVIDIA_API_KEY",
+        validation_alias=AliasChoices("NEMOTRON_API_KEY", "NVIDIA_API_KEY"),
     )
     nemotron_model: str = Field(
         default="nvidia/nemotron-3-super-120b-a12b",
@@ -50,24 +73,92 @@ class Settings(BaseSettings):
         validation_alias="NEMOTRON_BASE_URL",
     )
     nemotron_timeout_seconds: float = Field(
-        default=30,
+        default=900,
         gt=0,
         validation_alias="NEMOTRON_TIMEOUT_SECONDS",
     )
+    nemotron_strict_timeout_seconds: float = Field(
+        default=900,
+        gt=0,
+        validation_alias="NEMOTRON_STRICT_TIMEOUT_SECONDS",
+    )
+    nemotron_file_manifest_timeout_seconds: float = Field(
+        default=1200,
+        gt=0,
+        validation_alias="NEMOTRON_FILE_MANIFEST_TIMEOUT_SECONDS",
+    )
+    nemotron_repo_plan_timeout_seconds: float = Field(
+        default=1200,
+        gt=0,
+        validation_alias="NEMOTRON_REPO_PLAN_TIMEOUT_SECONDS",
+    )
     nemotron_max_retries: int = Field(
-        default=1,
+        default=3,
         ge=0,
         validation_alias="NEMOTRON_MAX_RETRIES",
     )
     nemotron_poll_attempts: int = Field(
-        default=3,
+        default=90,
         ge=1,
         validation_alias="NEMOTRON_POLL_ATTEMPTS",
     )
     nemotron_poll_interval_seconds: float = Field(
-        default=1,
+        default=2,
         ge=0,
         validation_alias="NEMOTRON_POLL_INTERVAL_SECONDS",
+    )
+    nemotron_poll_max_seconds: float = Field(
+        default=3600,
+        gt=0,
+        validation_alias="NEMOTRON_POLL_MAX_SECONDS",
+    )
+    nemotron_file_manifest_poll_max_seconds: float = Field(
+        default=3600,
+        gt=0,
+        validation_alias="NEMOTRON_FILE_MANIFEST_POLL_MAX_SECONDS",
+    )
+    nemotron_repo_plan_poll_max_seconds: float = Field(
+        default=3600,
+        gt=0,
+        validation_alias="NEMOTRON_REPO_PLAN_POLL_MAX_SECONDS",
+    )
+    nemotron_repo_plan_max_retries: int = Field(
+        default=5,
+        ge=0,
+        validation_alias="NEMOTRON_REPO_PLAN_MAX_RETRIES",
+    )
+    nemotron_reasoning_effort: str = Field(
+        default="none",
+        validation_alias="NEMOTRON_REASONING_EFFORT",
+    )
+    nemotron_planning_max_tokens: int = Field(
+        default=2500,
+        ge=900,
+        validation_alias="NEMOTRON_PLANNING_MAX_TOKENS",
+    )
+    nemotron_repo_plan_max_tokens: int = Field(
+        default=6000,
+        ge=2000,
+        validation_alias="NEMOTRON_REPO_PLAN_MAX_TOKENS",
+    )
+    nemotron_stack_recommendation_max_tokens: int = Field(
+        default=4000,
+        ge=1500,
+        validation_alias="NEMOTRON_STACK_RECOMMENDATION_MAX_TOKENS",
+    )
+    nemotron_file_manifest_max_tokens: int = Field(
+        default=3500,
+        ge=1200,
+        validation_alias="NEMOTRON_FILE_MANIFEST_MAX_TOKENS",
+    )
+    nemotron_file_manifest_max_retries: int = Field(
+        default=5,
+        ge=0,
+        validation_alias="NEMOTRON_FILE_MANIFEST_MAX_RETRIES",
+    )
+    require_live_file_manifest: bool = Field(
+        default=True,
+        validation_alias="REQUIRE_LIVE_FILE_MANIFEST",
     )
     openclaw_api_key: SecretStr | None = Field(
         default=None,
@@ -83,7 +174,7 @@ class Settings(BaseSettings):
     )
     openclaw_base_url: str | None = Field(
         default=None,
-        validation_alias="OPENCLAW_BASE_URL",
+        validation_alias=AliasChoices("OPENCLAW_ENDPOINT", "OPENCLAW_BASE_URL"),
     )
     supabase_url: str | None = Field(
         default=None,
@@ -184,6 +275,71 @@ class Settings(BaseSettings):
     @property
     def nvidia_configured(self) -> bool:
         return self._secret_has_value(self.nvidia_api_key)
+
+    @property
+    def nemotron_fast_fallback_active(self) -> bool:
+        return self.allow_idea_aware_partial and self.nemotron_fast_fallback
+
+    @property
+    def nemotron_strict_live_active(self) -> bool:
+        return not self.allow_idea_aware_partial
+
+    @property
+    def workflow_live_manifest_only(self) -> bool:
+        """Non-mock workflow runs commit only Nemotron live artifacts."""
+        return not self.mock_mode and self.require_live_file_manifest
+
+    def nemotron_read_timeout_seconds(self, purpose: str) -> float:
+        if self.nemotron_fast_fallback_active:
+            return self.nemotron_live_attempt_timeout_seconds
+        if purpose == "file_manifest":
+            return self.nemotron_file_manifest_timeout_seconds
+        if purpose == "plan_repo":
+            return self.nemotron_repo_plan_timeout_seconds
+        if self.nemotron_strict_live_active:
+            return max(self.nemotron_strict_timeout_seconds, self.nemotron_timeout_seconds)
+        return self.nemotron_timeout_seconds
+
+    @property
+    def nemotron_effective_timeout_seconds(self) -> float:
+        return self.nemotron_read_timeout_seconds("scope_mvp")
+
+    @property
+    def nemotron_effective_max_retries(self) -> int:
+        if self.nemotron_fast_fallback_active:
+            return self.nemotron_fast_fallback_max_retries
+        return self.nemotron_max_retries
+
+    def nemotron_max_tokens_for(self, purpose: str) -> int:
+        if purpose == "plan_repo":
+            return self.nemotron_repo_plan_max_tokens
+        if purpose == "file_manifest":
+            return self.nemotron_file_manifest_max_tokens
+        if purpose == "recommend_stack":
+            return self.nemotron_stack_recommendation_max_tokens
+        return self.nemotron_planning_max_tokens
+
+    def nemotron_max_retries_for(self, purpose: str) -> int:
+        if purpose == "file_manifest":
+            return max(self.nemotron_effective_max_retries, self.nemotron_file_manifest_max_retries)
+        if purpose == "plan_repo":
+            return max(self.nemotron_effective_max_retries, self.nemotron_repo_plan_max_retries)
+        return self.nemotron_effective_max_retries
+
+    def nemotron_poll_max_seconds_for(self, purpose: str) -> float:
+        if self.nemotron_fast_fallback_active:
+            return self.nemotron_fast_fallback_poll_max_seconds
+        if purpose == "file_manifest":
+            return self.nemotron_file_manifest_poll_max_seconds
+        if purpose == "plan_repo":
+            return self.nemotron_repo_plan_poll_max_seconds
+        if self.nemotron_strict_live_active:
+            return self.nemotron_poll_max_seconds
+        return self.nemotron_poll_max_seconds
+
+    @property
+    def nemotron_effective_poll_max_seconds(self) -> float:
+        return self.nemotron_poll_max_seconds_for("scope_mvp")
 
     @property
     def openclaw_configured(self) -> bool:

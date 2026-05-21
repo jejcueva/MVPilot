@@ -18,6 +18,7 @@ from agent.routers.github import router as github_router
 from agent.routers.github import upload_router as github_upload_router
 from agent.routers.health import router as health_router
 from agent.service import AgentService
+from agent.project_session_store import SupabasePersistingTaskStore, build_task_store
 from agent.task_store import InMemoryTaskStore
 
 load_dotenv()
@@ -29,7 +30,7 @@ def create_app(
     task_store: InMemoryTaskStore | None = None,
 ) -> FastAPI:
     active_settings = settings or build_settings()
-    active_task_store = task_store or InMemoryTaskStore()
+    active_task_store = task_store or build_task_store(active_settings)
     if active_settings.adapter_mode == "live" and active_settings.supabase_configured:
         github_connection_store = SupabaseGitHubConnectionStore(active_settings)
     else:

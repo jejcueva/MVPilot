@@ -8,7 +8,10 @@ from agent.service import AgentService
 from agent.task_store import InMemoryTaskStore
 from agent.adapters import InMemoryToolAdapter
 from agent.github_oauth import GitHubWorkflowAuth
+from agent.stack_recommendation import stack_items_from_recommended
+from agent.model_client import ModelCallResult
 from agent.workflow import (
+    _require_live_nemotron_result,
     build_initial_state,
     build_workflow,
     route_after_tool_result,
@@ -163,9 +166,12 @@ async def test_full_workflow_completes_with_expected_timeline(mock_live_rag_sear
         "exchange_github_code",
         "retrieve_context",
         "scope_mvp",
+        "recommend_stack",
         "plan_repo",
         "create_repo",
         "generate_files",
+        "validate_mvp",
+        "debug_generated_files",
         "commit_progress",
         "verify_build",
         "handle_blocker",
@@ -191,15 +197,18 @@ async def test_full_workflow_completes_with_expected_timeline(mock_live_rag_sear
         "package.json",
         "src/App.jsx",
         "backend/main.py",
-        "backend/mvp_engine.py",
+        "backend/db.py",
         "tests/test_backend.py",
         "docs/ARCHITECTURE.md",
         "docs/BUILD_LOG.md",
         "docs/DATABASE_SCHEMA.sql",
-        "docs/IMPLEMENTATION_PLAN.md",
-        "demo/demo_script.md",
+        "docs/WALKTHROUGH.md",
+        "docs/DEPLOY.md",
+        "docs/PROJECT_PLAN.md",
         "final_report.json",
     }
+    assert detail.mvp_plan.get("demo_path")
+    assert detail.mvp_plan.get("vertical_pack")
     model_backed_steps = {
         step.node_name: step
         for step in detail.agent_steps
@@ -207,6 +216,7 @@ async def test_full_workflow_completes_with_expected_timeline(mock_live_rag_sear
     }
     assert set(model_backed_steps) == {
         "scope_mvp",
+        "recommend_stack",
         "plan_repo",
         "generate_files",
         "handle_blocker",
@@ -214,7 +224,7 @@ async def test_full_workflow_completes_with_expected_timeline(mock_live_rag_sear
     }
     assert model_backed_steps["scope_mvp"].model == settings.nemotron_model
     assert model_backed_steps["plan_repo"].model == settings.nemotron_model
-    assert model_backed_steps["generate_files"].model == settings.nemotron_fast_model
+    assert model_backed_steps["generate_files"].model == settings.nemotron_model
     assert all(step.model_mode == "mock" for step in model_backed_steps.values())
     assert all(step.decision_trace for step in detail.agent_steps)
     assert detail.final_report["readme"]["content"]
@@ -248,7 +258,7 @@ def test_route_after_tool_result_fails_unrecoverable_result():
 
 
 @pytest.mark.asyncio
-async def test_workflow_plan_repo_prompt_uses_default_stack_when_rag_stack_is_empty(monkeypatch):
+async def test_workflow_plan_repo_prompt_uses_recommended_stack_after_selector(monkeypatch):
     async def fake_search(query: str, top_k: int = 5, doc_types=None):
         return []
 
@@ -282,10 +292,15 @@ async def test_workflow_plan_repo_prompt_uses_default_stack_when_rag_stack_is_em
     plan_prompt = model_client.prompts["plan_repo"]
 
     assert final_state["build_context"]["requiredTechStackPieces"]
-    assert final_state["build_context"]["resolvedTechStack"]["source"] == "default"
-    assert "Next.js" in plan_prompt
-    assert "FastAPI" in plan_prompt
-    assert "Supabase Postgres" in plan_prompt
+    assert final_state["recommended_stack"]
+    assert final_state["build_context"]["resolvedTechStack"]["source"] == "stack_recommendation"
+    assert "Recommended stack (binding)" in plan_prompt or "recommendedStack" in plan_prompt
+    assert "recommend_stack" in model_client.prompts
+    assert "Do not assume the generated project must use MVPilot" in model_client.prompts["recommend_stack"]
+    assert final_state["recommended_stack"]
+    assert final_state["repo_plan"]["selected_stack"] == stack_items_from_recommended(
+        final_state["recommended_stack"]
+    )
 
 
 @pytest.mark.asyncio
@@ -476,3 +491,34 @@ async def test_workflow_memory_integration(mock_live_rag_search):
         assert len(detail2.memory_matches) > 0
         assert detail2.memory_matches[0]["id"] == "mock_memory"
         assert mock_store.write_memory.call_count == 2
+
+
+def test_require_live_allows_degraded_plan_repo_when_partial_enabled() -> None:
+    settings = Settings(allow_idea_aware_partial=True, require_live_file_manifest=True)
+    result = ModelCallResult(
+        output=object(),
+        mode="degraded",
+        model="nvidia/test",
+        purpose="plan_repo",
+        latency_ms=0,
+        fallback_reason="HTTP 504 from Nemotron.",
+    )
+    _require_live_nemotron_result(
+        result, "plan_repo", enforced=True, settings=settings
+    )
+
+
+def test_require_live_blocks_degraded_file_manifest_when_required() -> None:
+    settings = Settings(allow_idea_aware_partial=True, require_live_file_manifest=True)
+    result = ModelCallResult(
+        output=object(),
+        mode="degraded",
+        model="nvidia/test",
+        purpose="file_manifest",
+        latency_ms=0,
+        fallback_reason="HTTP 504 from Nemotron.",
+    )
+    with pytest.raises(RuntimeError, match="file_manifest"):
+        _require_live_nemotron_result(
+            result, "file_manifest", enforced=True, settings=settings
+        )

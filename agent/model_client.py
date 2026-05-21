@@ -4,7 +4,7 @@ import asyncio
 import json
 from dataclasses import dataclass, replace
 from time import perf_counter
-from typing import Literal, Protocol, TypeVar
+from typing import Any, Literal, Protocol, TypeVar
 
 import httpx
 from pydantic import BaseModel, ValidationError
@@ -14,18 +14,17 @@ from agent.generated_project import build_project_artifacts
 from agent.model_outputs import (
     BlockerAnalysisOutput,
     DemoScriptOutput,
-    FilePlanOutput,
     FileManifestOutput,
     FinalReadmeOutput,
-    GeneratedFileOutput,
     MvpScopeOutput,
     PitchOutput,
+    RecommendedStackOutput,
     RepoPlanOutput,
 )
 
 
 OutputT = TypeVar("OutputT", bound=BaseModel)
-ModelMode = Literal["mock", "live", "fallback"]
+ModelMode = Literal["mock", "live", "degraded", "partial"]
 
 
 class ModelClientError(Exception):
@@ -36,6 +35,79 @@ class ModelClientError(Exception):
 
 class RetryableModelClientError(ModelClientError):
     pass
+
+
+def _strip_json_fences(text: str) -> str:
+    stripped = text.strip()
+    if not stripped.startswith("```"):
+        return stripped
+
+    lines = stripped.splitlines()
+    if lines and lines[0].startswith("```"):
+        lines = lines[1:]
+    if lines and lines[-1].strip() == "```":
+        lines = lines[:-1]
+    return "\n".join(lines).strip()
+
+
+def _extract_json_object(text: str) -> str | None:
+    cleaned = _strip_json_fences(text)
+    start = cleaned.find("{")
+    if start < 0:
+        return None
+
+    depth = 0
+    in_string = False
+    escape = False
+    for index in range(start, len(cleaned)):
+        char = cleaned[index]
+        if in_string:
+            if escape:
+                escape = False
+            elif char == "\\":
+                escape = True
+            elif char == '"':
+                in_string = False
+            continue
+        if char == '"':
+            in_string = True
+        elif char == "{":
+            depth += 1
+        elif char == "}":
+            depth -= 1
+            if depth == 0:
+                return cleaned[start : index + 1]
+    return None
+
+
+def _parse_json_text(raw: str) -> Any:
+    candidates: list[str] = []
+    stripped = _strip_json_fences(raw)
+    candidates.append(stripped)
+    extracted = _extract_json_object(stripped)
+    if extracted and extracted not in candidates:
+        candidates.insert(0, extracted)
+
+    last_error: json.JSONDecodeError | None = None
+    for candidate in candidates:
+        try:
+            return json.loads(candidate)
+        except json.JSONDecodeError as exc:
+            last_error = exc
+
+    if last_error is not None:
+        raise last_error
+    raise json.JSONDecodeError("No JSON object found in Nemotron response.", raw, 0)
+
+
+def _json_decode_looks_truncated(exc: BaseException | None) -> bool:
+    if not isinstance(exc, json.JSONDecodeError):
+        return False
+    return "unterminated" in str(exc).lower()
+
+
+def _bump_max_tokens(current: int, *, cap: int = 12_000) -> int:
+    return min(max(current * 2, current + 2000), cap)
 
 
 @dataclass(frozen=True)
@@ -105,11 +177,22 @@ class NemotronModelClient:
     def __init__(
         self,
         settings: Settings,
-        *,
-        fallback_client: DeterministicModelClient | None = None,
     ) -> None:
         self._settings = settings
-        self._fallback_client = fallback_client
+
+    def _allows_partial_fallback(self, purpose: str) -> bool:
+        if not self._settings.allow_idea_aware_partial:
+            return False
+        if purpose == "file_manifest" and self._settings.require_live_file_manifest:
+            return False
+        return True
+
+    @staticmethod
+    async def _backoff_before_retry(reason: str, attempt: int, *, purpose: str) -> None:
+        if "504" not in reason:
+            return
+        cap = 90.0 if purpose == "plan_repo" else 45.0
+        await asyncio.sleep(min(cap, 2.0 ** (attempt + 1)))
 
     async def complete_structured(
         self,
@@ -119,10 +202,10 @@ class NemotronModelClient:
         prompt: str,
         response_model: type[OutputT],
         max_tokens: int = 1200,
-        reasoning_effort: str = "medium",
+        reasoning_effort: str | None = None,
     ) -> ModelCallResult[OutputT]:
         if not self._settings.nvidia_configured:
-            return await self._fallback(
+            return await self._idea_specific_partial(
                 purpose=purpose,
                 model=model,
                 prompt=prompt,
@@ -131,17 +214,23 @@ class NemotronModelClient:
             )
 
         started = perf_counter()
-        attempts = max(0, self._settings.nemotron_max_retries) + 1
+        attempts = max(0, self._settings.nemotron_max_retries_for(purpose)) + 1
         last_reason = "Nemotron request failed."
+        effort = reasoning_effort or self._settings.nemotron_reasoning_effort
+        effective_max_tokens = max(
+            max_tokens,
+            self._settings.nemotron_max_tokens_for(purpose),
+        )
 
         for attempt in range(attempts):
             try:
                 payload = await self._send_completion_request(
+                    purpose=purpose,
                     model=model,
                     prompt=prompt,
                     response_model=response_model,
-                    max_tokens=max_tokens,
-                    reasoning_effort=reasoning_effort,
+                    max_tokens=effective_max_tokens,
+                    reasoning_effort=effort,
                 )
                 return self._parse_completion_payload(
                     payload=payload,
@@ -152,9 +241,22 @@ class NemotronModelClient:
                 )
             except RetryableModelClientError as exc:
                 last_reason = exc.safe_message
+                if (
+                    last_reason == "Nemotron returned truncated JSON."
+                    and effective_max_tokens < 12_000
+                ):
+                    effective_max_tokens = _bump_max_tokens(effective_max_tokens)
                 if attempt + 1 < attempts:
+                    await self._backoff_before_retry(
+                        last_reason, attempt, purpose=purpose
+                    )
                     continue
-                return await self._fallback(
+                if not self._allows_partial_fallback(purpose):
+                    raise ModelClientError(
+                        f"Live Nemotron is required for full project generation ({last_reason}). "
+                        "Set NEMOTRON_API_KEY/NVIDIA_API_KEY or enable degraded mode explicitly."
+                    ) from exc
+                return await self._idea_specific_partial(
                     purpose=purpose,
                     model=model,
                     prompt=prompt,
@@ -163,7 +265,9 @@ class NemotronModelClient:
                     started=started,
                 )
             except ModelClientError as exc:
-                return await self._fallback(
+                if not self._allows_partial_fallback(purpose):
+                    raise
+                return await self._idea_specific_partial(
                     purpose=purpose,
                     model=model,
                     prompt=prompt,
@@ -171,11 +275,19 @@ class NemotronModelClient:
                     reason=exc.safe_message,
                     started=started,
                 )
-            except httpx.TimeoutException:
+            except httpx.TimeoutException as exc:
                 last_reason = "Nemotron request timed out."
                 if attempt + 1 < attempts:
+                    await self._backoff_before_retry(
+                        last_reason, attempt, purpose=purpose
+                    )
                     continue
-                return await self._fallback(
+                if not self._allows_partial_fallback(purpose):
+                    raise ModelClientError(
+                        f"Live Nemotron is required for full project generation ({last_reason}). "
+                        "Set NEMOTRON_API_KEY/NVIDIA_API_KEY or enable degraded mode explicitly."
+                    ) from exc
+                return await self._idea_specific_partial(
                     purpose=purpose,
                     model=model,
                     prompt=prompt,
@@ -183,11 +295,19 @@ class NemotronModelClient:
                     reason=last_reason,
                     started=started,
                 )
-            except httpx.HTTPError:
+            except httpx.HTTPError as exc:
                 last_reason = "Nemotron request failed."
                 if attempt + 1 < attempts:
+                    await self._backoff_before_retry(
+                        last_reason, attempt, purpose=purpose
+                    )
                     continue
-                return await self._fallback(
+                if not self._allows_partial_fallback(purpose):
+                    raise ModelClientError(
+                        f"Live Nemotron is required for full project generation ({last_reason}). "
+                        "Set NEMOTRON_API_KEY/NVIDIA_API_KEY or enable degraded mode explicitly."
+                    ) from exc
+                return await self._idea_specific_partial(
                     purpose=purpose,
                     model=model,
                     prompt=prompt,
@@ -196,7 +316,12 @@ class NemotronModelClient:
                     started=started,
                 )
 
-        return await self._fallback(
+        if not self._allows_partial_fallback(purpose):
+            raise ModelClientError(
+                f"Live Nemotron is required for full project generation ({last_reason}). "
+                "Set NEMOTRON_API_KEY/NVIDIA_API_KEY or enable degraded mode explicitly."
+            )
+        return await self._idea_specific_partial(
             purpose=purpose,
             model=model,
             prompt=prompt,
@@ -208,6 +333,7 @@ class NemotronModelClient:
     async def _send_completion_request(
         self,
         *,
+        purpose: str,
         model: str,
         prompt: str,
         response_model: type[OutputT],
@@ -215,26 +341,32 @@ class NemotronModelClient:
         reasoning_effort: str,
     ) -> dict:
         url = f"{self._settings.nemotron_base_url.rstrip('/')}/chat/completions"
-        schema = json.dumps(response_model.model_json_schema(), separators=(",", ":"))
+        if purpose == "file_manifest":
+            system_content = (
+                "You are MVPilot's full project repository manifest planner. Return only one "
+                "complete JSON object matching the guided schema. List every required "
+                "file path with kind and a short summary. Do not include file bodies or "
+                "content fields. No markdown fences, prose, or trailing commas."
+            )
+        else:
+            system_content = (
+                "You are MVPilot's full project planning model. Return only "
+                "one complete JSON object that matches the guided schema. "
+                "No markdown fences, prose, or trailing commas. Close all "
+                "strings, arrays, and objects."
+            )
         request_body = {
             "model": model,
             "messages": [
-                {
-                    "role": "system",
-                    "content": (
-                        "You are MVPilot's structured planning model. Return only "
-                        "valid JSON. Do not include markdown fences, prose, or comments. "
-                        "The JSON must match this schema: "
-                        f"{schema}"
-                    ),
-                },
+                {"role": "system", "content": system_content},
                 {"role": "user", "content": prompt},
             ],
             "temperature": 0.2,
             "top_p": 0.95,
-            "max_tokens": max(800, max_tokens),
+            "max_tokens": max_tokens,
             "stream": False,
             "reasoning_effort": reasoning_effort,
+            "guided_json": response_model.model_json_schema(),
         }
         headers = {
             "Authorization": (
@@ -243,12 +375,22 @@ class NemotronModelClient:
             "Content-Type": "application/json",
         }
 
-        timeout = httpx.Timeout(self._settings.nemotron_timeout_seconds)
+        read_timeout = self._settings.nemotron_read_timeout_seconds(purpose)
+        timeout = httpx.Timeout(
+            connect=30.0,
+            read=read_timeout,
+            write=120.0,
+            pool=60.0,
+        )
         async with httpx.AsyncClient(timeout=timeout) as client:
             response = await client.post(url, headers=headers, json=request_body)
             if response.status_code == 202:
                 request_id = self._extract_request_id(response)
-                return await self._poll_status(client=client, request_id=request_id)
+                return await self._poll_status(
+                    client=client,
+                    request_id=request_id,
+                    purpose=purpose,
+                )
             if response.status_code == 200:
                 return self._safe_response_json(response)
             if response.status_code == 429 or response.status_code >= 500:
@@ -262,15 +404,20 @@ class NemotronModelClient:
         *,
         client: httpx.AsyncClient,
         request_id: str,
+        purpose: str,
     ) -> dict:
         status_url = (
             f"{self._settings.nemotron_base_url.rstrip('/')}/status/{request_id}"
         )
-        attempts = max(1, self._settings.nemotron_poll_attempts)
+        deadline = perf_counter() + self._settings.nemotron_poll_max_seconds_for(purpose)
+        max_attempts = max(1, self._settings.nemotron_poll_attempts)
+        interval = self._settings.nemotron_poll_interval_seconds
 
-        for _ in range(attempts):
-            if self._settings.nemotron_poll_interval_seconds > 0:
-                await asyncio.sleep(self._settings.nemotron_poll_interval_seconds)
+        for attempt in range(max_attempts):
+            if perf_counter() >= deadline:
+                break
+            if interval > 0 and attempt > 0:
+                await asyncio.sleep(interval)
 
             response = await client.get(status_url)
             if response.status_code == 202:
@@ -291,7 +438,7 @@ class NemotronModelClient:
                     continue
                 return payload
 
-        raise ModelClientError("Nemotron request stayed pending.")
+        raise RetryableModelClientError("Nemotron request stayed pending.")
 
     def _parse_completion_payload(
         self,
@@ -304,22 +451,24 @@ class NemotronModelClient:
     ) -> ModelCallResult[OutputT]:
         raw_content = self._extract_content(payload)
         try:
-            parsed = (
-                json.loads(_strip_json_wrapper(raw_content))
-                if isinstance(raw_content, str)
-                else raw_content
-            )
+            if isinstance(raw_content, str):
+                parsed = _parse_json_text(raw_content)
+            else:
+                parsed = raw_content
         except json.JSONDecodeError as exc:
-            raise ModelClientError("Nemotron returned invalid JSON.") from exc
+            message = (
+                "Nemotron returned truncated JSON."
+                if _json_decode_looks_truncated(exc)
+                else "Nemotron returned invalid JSON."
+            )
+            raise RetryableModelClientError(message) from exc
 
         try:
             output = response_model.model_validate(parsed)
         except ValidationError as exc:
-            raise ModelClientError(
+            raise RetryableModelClientError(
                 "Nemotron response failed schema validation."
             ) from exc
-        if hasattr(output, "mode"):
-            output = output.model_copy(update={"mode": "live"})
 
         return ModelCallResult(
             output=output,
@@ -329,7 +478,7 @@ class NemotronModelClient:
             latency_ms=_elapsed_ms(started),
         )
 
-    async def _fallback(
+    async def _idea_specific_partial(
         self,
         *,
         purpose: str,
@@ -339,11 +488,22 @@ class NemotronModelClient:
         reason: str,
         started: float | None = None,
     ) -> ModelCallResult[OutputT]:
-        fallback_client = self._fallback_client or DeterministicModelClient(
-            mode="fallback",
-            fallback_reason=reason,
-        )
-        result = await fallback_client.complete_structured(
+        if not self._settings.allow_idea_aware_partial:
+            raise ModelClientError(
+                f"Live Nemotron is required for full project generation ({reason}). "
+                "Set NEMOTRON_API_KEY/NVIDIA_API_KEY or enable degraded mode explicitly."
+            )
+
+        from agent.idea_aware_partial import IdeaAwarePartialClient
+
+        partial_reason = reason
+        if self._settings.nemotron_fast_fallback_active:
+            partial_reason = (
+                f"{reason} Using explicit degraded project output after a short live Nemotron attempt."
+            )
+
+        partial_client = IdeaAwarePartialClient(partial_reason=partial_reason)
+        result = await partial_client.complete_structured(
             purpose=purpose,
             model=model,
             prompt=prompt,
@@ -378,14 +538,14 @@ class NemotronModelClient:
             first_choice = choices[0]
             if isinstance(first_choice, dict):
                 message = first_choice.get("message")
-                if isinstance(message, dict) and "content" in message:
-                    content = message["content"]
-                    if content is not None:
+                if isinstance(message, dict):
+                    content = message.get("content")
+                    if isinstance(content, str) and content.strip():
                         return content
-                    if message.get("reasoning_content") or message.get("reasoning"):
-                        raise ModelClientError(
-                            "Nemotron returned reasoning without completion content."
-                        )
+                    for key in ("reasoning_content", "reasoning"):
+                        alternate = message.get(key)
+                        if isinstance(alternate, str) and alternate.strip():
+                            return alternate
                 if "text" in first_choice:
                     return first_choice["text"]
 
@@ -406,26 +566,14 @@ def _elapsed_ms(started: float) -> int:
     return max(0, round((perf_counter() - started) * 1000))
 
 
-def _strip_json_wrapper(content: str) -> str:
-    stripped = content.strip()
-    if stripped.startswith("```"):
-        lines = stripped.splitlines()
-        if lines and lines[0].startswith("```"):
-            lines = lines[1:]
-        if lines and lines[-1].startswith("```"):
-            lines = lines[:-1]
-        stripped = "\n".join(lines).strip()
-    return stripped
-
-
 def _trace(
     mode: ModelMode,
     fallback_reason: str | None,
     entries: list[str],
 ) -> list[str]:
-    if mode == "fallback":
-        reason = fallback_reason or "Nemotron request failed."
-        return [f"Fallback mode: {reason}", *entries]
+    if mode in {"degraded", "partial"}:
+        prefix = f"Degraded mode: {fallback_reason or 'live model unavailable; project-specific scaffold used'}"
+        return [prefix, *entries]
     return entries
 
 
@@ -440,7 +588,7 @@ def _extract_idea(prompt: str) -> str:
 
 def _clean_idea(value: str) -> str:
     cleaned = " ".join(value.strip().split())
-    return cleaned or "the submitted MVP idea"
+    return cleaned or "the submitted project idea"
 
 
 def _idea_label(idea: str) -> str:
@@ -455,7 +603,7 @@ def _idea_title(idea: str) -> str:
         if lowered.startswith(prefix):
             label = label[len(prefix):]
             break
-    return label[:1].upper() + label[1:] if label else "Submitted MVP"
+    return label[:1].upper() + label[1:] if label else "Submitted Project"
 
 
 def _deterministic_payload(
@@ -465,52 +613,115 @@ def _deterministic_payload(
     prompt: str,
 ) -> dict:
     idea = _extract_idea(prompt)
-    if purpose == "plan_repo":
+    if purpose == "recommend_stack":
+        return _stack_recommendation_payload(mode, fallback_reason, idea, prompt)
+    if purpose in {"plan_repo", "architecture_plan"}:
         return _repo_plan_payload(mode, fallback_reason, idea, prompt)
     if purpose == "file_manifest":
         return _file_manifest_payload(mode, fallback_reason, idea, prompt)
-    if purpose == "file_plan":
-        return _file_plan_payload(mode, fallback_reason, idea, prompt)
-    if purpose == "file_content":
-        return _file_content_payload(mode, fallback_reason, idea, prompt)
     if purpose == "final_readme":
         return _final_readme_payload(mode, fallback_reason, idea, prompt)
-    if purpose == "demo_script":
+    if purpose in {"demo_script", "walkthrough"}:
         return _demo_script_payload(mode, fallback_reason, idea, prompt)
     if purpose == "pitch":
         return _pitch_payload(mode, fallback_reason, idea, prompt)
 
     payloads = {
         "scope_mvp": _scope_payload,
+        "requirement_expansion": _scope_payload,
         "blocker_analysis": _blocker_analysis_payload,
     }
     try:
-        return payloads[purpose](mode, fallback_reason, idea)
+        return payloads[purpose](mode, fallback_reason, idea, prompt)
     except KeyError as exc:
         raise ModelClientError(f"Unsupported model purpose: {purpose}.") from exc
 
 
-def _scope_payload(mode: ModelMode, fallback_reason: str | None, idea: str) -> dict:
+def _scope_payload(
+    mode: ModelMode,
+    fallback_reason: str | None,
+    idea: str,
+    prompt: str = "",
+) -> dict:
+    from agent.idea_context import extract_json_section, features_from_context, target_users_from_context
+
     label = _idea_label(idea)
-    return MvpScopeOutput(
-        target_user="primary user for the submitted MVP",
-        must_have=[
-            "clear user intake",
-            "source-grounded MVP scope",
-            "visible progress and final package",
-        ],
-        demo_boundary=f"one mocked workflow for: {label}",
-        mode=mode,
-        decision_trace=_trace(
-            mode,
-            fallback_reason,
-            [
-                f"Grounded the scope in the submitted idea: {label}.",
-                "Kept the MVP to one visible workflow for a short hackathon demo.",
-                "Rejected broad integrations until the core demo path is reliable.",
+    intake = extract_json_section(prompt, "Frontend intake:\n")
+    features = features_from_context(idea=idea, intake=intake)
+    from agent.project_depth import enrich_project_requirements
+
+    target = target_users_from_context(intake) or "users described in the submitted project"
+    requirements = enrich_project_requirements(
+        {
+            "target_users": target,
+            "user_personas": [target, "Admin or operator"],
+            "core_features": features,
+            "advanced_features": [
+                "Authenticated workspace",
+                "Operational dashboard",
+                "Generated project evidence log",
             ],
-        ),
-    ).model_dump()
+            "success_criteria": [
+                "The primary user can complete the end-to-end workflow.",
+                "The codebase includes frontend, backend, database schema, tests, and docs.",
+            ],
+            "project_depth": intake.get("projectDepth") or "Advanced Project",
+            "target_platform": intake.get("targetPlatform") or "web app",
+            "mode": mode,
+            "decision_trace": _trace(
+                mode,
+                fallback_reason,
+                [
+                    f"Grounded requirements in the submitted idea: {label}.",
+                    "Expanded the idea into a multi-feature project brief.",
+                    "Kept fallback behavior explicit as degraded mode when live generation is unavailable.",
+                ],
+            ),
+        },
+        idea=idea,
+        intake=intake,
+    )
+    requirements["mode"] = mode
+    requirements["decision_trace"] = _trace(
+        mode,
+        fallback_reason,
+        [
+            f"Grounded requirements in the submitted idea: {label}.",
+            "Expanded the idea into a multi-feature project brief.",
+            "Kept fallback behavior explicit as degraded mode when live generation is unavailable.",
+        ],
+    )
+    return MvpScopeOutput.model_validate(requirements).model_dump()
+
+
+def _stack_recommendation_payload(
+    mode: ModelMode,
+    fallback_reason: str | None,
+    idea: str,
+    prompt: str,
+) -> dict:
+    from agent.idea_context import extract_json_section
+    from agent.stack_recommendation import recommend_stack_heuristic
+
+    intake = extract_json_section(prompt, "Frontend intake:\n")
+    requirements = extract_json_section(prompt, "Project requirements:\n")
+    build_context = extract_json_section(prompt, "Structured build context:\n")
+    payload = recommend_stack_heuristic(
+        idea=idea,
+        project_requirements=requirements,
+        build_context=build_context if isinstance(build_context, dict) else {},
+    )
+    payload["mode"] = mode
+    payload["decision_trace"] = _trace(
+        mode,
+        fallback_reason,
+        [
+            f"Stack Selector Agent grounded stack in: {_idea_label(idea)}.",
+            "Did not copy MVPilot host platform defaults.",
+            "Aligned stack with idea, depth, platform, and RAG hints.",
+        ],
+    )
+    return RecommendedStackOutput.model_validate(payload).model_dump()
 
 
 def _repo_plan_payload(
@@ -519,48 +730,113 @@ def _repo_plan_payload(
     idea: str,
     prompt: str,
 ) -> dict:
+    from agent.idea_context import extract_json_section
+    from agent.stack_recommendation import align_architecture_plan_with_recommended_stack
+
     label = _idea_label(idea)
     title = _project_title(idea, prompt)
     resolved_stack = _extract_resolved_stack_summary(prompt)
     warning_summary = _source_warning_summary(prompt)
+    build_context = extract_json_section(prompt, "Structured build context:\n")
+    recommended = (
+        build_context.get("recommendedStack")
+        if isinstance(build_context, dict)
+        else None
+    )
     files = [
         "README.md",
+        "package.json",
+        "index.html",
+        "src/App.jsx",
+        "src/main.jsx",
+        "src/lib/api.js",
+        "src/state/projectState.js",
+        "src/styles.css",
+        "backend/main.py",
+        "backend/models.py",
+        "backend/services.py",
+        "backend/db.py",
         "requirements.txt",
-        "src/app.py",
-        "src/core/agent.py",
-        "tests/test_app.py",
+        "tests/test_backend.py",
+        "docs/PROJECT_PLAN.md",
         "docs/ARCHITECTURE.md",
+        "docs/API_SPEC.md",
+        "docs/DATABASE_SCHEMA.sql",
+        "docs/TESTING_STRATEGY.md",
+        "docs/DEPLOY.md",
+        "docs/AGENT_LOG.md",
         "docs/BUILD_LOG.md",
-        "demo/demo_script.md",
+        "docs/KNOWN_LIMITATIONS.md",
+        "docs/WALKTHROUGH.md",
         ".env.example",
     ]
-    return RepoPlanOutput(
+    plan_payload = RepoPlanOutput(
         files=files,
-        required_files=files,
+        file_tree=files,
         selected_stack=[item.strip() for item in resolved_stack.split(",") if item.strip()],
-        repo_structure=[
-            "README.md",
-            "src/ for application code",
-            "tests/ for smoke tests",
-            "docs/ for architecture and build logs",
-            "demo/ for the judging walkthrough",
+        architecture_overview=[
+            f"Use submitted title as project identity: {title}.",
+            f"Use resolvedTechStack for generated files, tests, and architecture: {resolved_stack}.",
+            "Generate a complete full-stack project with source, tests, docs, database schema, and deployment notes.",
+        ],
+        frontend_architecture=[
+            "React workspace with authenticated project flow, generation surface, review queue, and dashboard.",
+            "API client module isolates fetch calls from UI state.",
+        ],
+        backend_architecture=[
+            "FastAPI app with auth, upload, generation, review, dashboard, and health routes.",
+            "Service layer owns domain logic and provider adapters.",
+        ],
+        data_model=[
+            "users",
+            "project_assets",
+            "generated_items",
+            "activity_logs",
+        ],
+        api_design=[
+            "POST /api/auth/login",
+            "POST /api/uploads",
+            "POST /api/quizzes",
+            "GET /api/flashcards/review",
+            "GET /api/dashboard",
+        ],
+        auth_design=[
+            "Development login route for local testing.",
+            "Production-ready auth replacement documented for Supabase/Auth.js/Clerk.",
+        ],
+        database_schema=[
+            "Postgres tables for users, assets, generated items, and activity logs.",
+        ],
+        state_management=[
+            "React local state for current session, generated artifacts, review queue, and dashboard metrics.",
+        ],
+        integration_points=[
+            "AI provider hooks in backend services.",
+            "Supabase/Postgres persistence boundary in backend db adapter.",
         ],
         implementation_steps=[
-            "Create a minimal API entrypoint.",
-            "Add a deterministic agent core that mirrors the scoped MVP.",
-            "Document architecture, build evidence, and demo flow.",
+            "Create the product-specific frontend workspace.",
+            "Generate backend/API routes that serve the full project data flow.",
+            "Add auth, upload, generation, dashboard, and review workflows.",
+            "Document architecture, setup, env vars, testing, deployment, and limitations.",
             "Commit generated files through the GitHub Agent.",
         ],
         agent_assignments=[
-            "orchestrator: scope, plan, and validate the package",
-            "rag: provide rules, stack, and safety evidence before planning",
-            "github: create or update the repository and commit files",
-            "black_box: store decisions, logs, artifacts, and final summary",
+            "Product Strategist Agent: requirements, personas, features, success criteria",
+            "Research/RAG Agent: source URLs, uploaded docs, memory, and context",
+            "System Architect Agent: architecture, stack, file tree, integration points",
+            "Data/API Agent: models, API routes, validation, auth, storage",
+            "Frontend Agent: screens, components, state, user experience",
+            "Backend Agent: routes, services, persistence, provider boundaries",
+            "QA Agent: validation, test plan, build verification",
+            "Documentation Agent: README, setup, env, architecture, usage",
+            "GitHub Agent: repo create/update and commit",
+            "Logger Agent: live progress and stored logs",
         ],
         github_actions_needed=[
             "create_new_repo or use_existing_repo from frontend intake",
             "commit generated project files",
-            "return repoUrl, commitUrl, branch, filesUploaded, and errors",
+            "return repoUrl, commitUrl, branch, filesUploaded, and validation status",
         ],
         generated_artifacts=files,
         security_constraints=[
@@ -568,50 +844,52 @@ def _repo_plan_payload(
             "Only include placeholder values in .env.example.",
             "Keep GitHub and Supabase service credentials server-side.",
         ],
-        demo_requirements=[
-            "Show the flight-stage progress path.",
-            "Show RAG evidence before plan generation.",
-            "End with GitHub repo and commit links.",
+        test_plan=["service unit tests", "API integration tests", "frontend build check", "repository health validation"],
+        deployment_plan=[
+            "Deploy frontend as a static Vite app.",
+            "Deploy backend as a Python web service.",
+            "Run Postgres/Supabase schema and set backend-only secrets.",
         ],
-        test_plan=["unit workflow", "API integration", "repo health smoke check"],
-        architecture_notes=[
-            f"Use submitted title as project identity: {title}.",
-            f"Use resolvedTechStack for generated files, tests, and architecture: {resolved_stack}.",
-            "Keep model calls behind a client protocol.",
-            "Keep GitHub and build actions behind mockable tool adapters.",
-            warning_summary or "No submitted source warnings were present.",
+        documentation_plan=[
+            "README with setup and usage",
+            "Architecture, API, database, testing, deployment, limitations, and walkthrough docs",
         ],
         mode=mode,
         decision_trace=_trace(
             mode,
             fallback_reason,
             [
-                f"Selected a complete but small repo package for the submitted idea: {label}.",
+                f"Selected a complete generated project package for the submitted idea: {label}.",
                 "Planned around the RAG build context before any GitHub action.",
-                "Kept generated files secret-safe and repo-health checkable.",
+                warning_summary or "No submitted source warnings were present.",
+                "Kept generated files secret-safe, testable, and deployable.",
             ],
         ),
     ).model_dump()
+    return align_architecture_plan_with_recommended_stack(
+        plan_payload,
+        recommended if isinstance(recommended, dict) else None,
+    )
 
 
 def _extract_resolved_stack_summary(prompt: str) -> str:
     marker = "Resolved tech stack:\n"
     if marker not in prompt:
-        return "the resolved MVPilot stack from build context"
+        return "the resolved project stack from build context"
 
     raw_block = prompt.split(marker, 1)[1].split("\n\n", 1)[0]
     try:
         payload = json.loads(raw_block)
     except json.JSONDecodeError:
-        return "the resolved MVPilot stack from build context"
+        return "the resolved project stack from build context"
 
     items = payload.get("items") if isinstance(payload, dict) else None
     if not isinstance(items, list):
-        return "the resolved MVPilot stack from build context"
+        return "the resolved project stack from build context"
 
     stack_items = [item for item in items if isinstance(item, str) and item.strip()]
     if not stack_items:
-        return "the resolved MVPilot stack from build context"
+        return "the resolved project stack from build context"
 
     return ", ".join(stack_items)
 
@@ -686,13 +964,15 @@ def _file_manifest_payload(
     resolved_stack = _extract_resolved_stack_summary(prompt)
     warning_summary = _source_warning_summary(prompt)
     source_warnings = _source_warnings(prompt)
-    repo_plan = _extract_json_section(prompt, "Repo plan:\n")
+    architecture_plan = _extract_json_section(prompt, "Architecture plan:\n") or _extract_json_section(prompt, "Repo plan:\n")
+    project_requirements = _extract_json_section(prompt, "Project requirements:\n") or _extract_json_section(prompt, "MVP scope:\n")
     artifacts = build_project_artifacts(
         idea=idea,
         title=title,
         resolved_stack=resolved_stack,
-        repo_plan=repo_plan,
+        architecture_plan=architecture_plan,
         source_warnings=source_warnings,
+        project_requirements=project_requirements,
     )
     return FileManifestOutput(
         artifacts=artifacts,
@@ -701,91 +981,34 @@ def _file_manifest_payload(
             mode,
             fallback_reason,
             [
-                f"Mapped {title} into runnable frontend, backend, database, tests, docs, and demo artifacts.",
+                f"Mapped {title} into complete frontend, backend, database, tests, docs, deployment, and walkthrough artifacts.",
                 f"Used resolved stack summary: {resolved_stack}.",
                 warning_summary or "No submitted source warnings were present.",
-                "Kept artifact content compact, commit-safe, and health-checkable.",
+                "Kept artifact content secret-safe, testable, and deployment-ready.",
             ],
         ),
     ).model_dump()
 
 
-def _file_plan_payload(
+def _blocker_analysis_payload(
     mode: ModelMode,
     fallback_reason: str | None,
     idea: str,
-    prompt: str,
+    prompt: str = "",
 ) -> dict:
-    payload = _file_manifest_payload(mode, fallback_reason, idea, prompt)
-    artifacts = [
-        {key: value for key, value in artifact.items() if key != "content"}
-        for artifact in payload["artifacts"]
-    ]
-    return FilePlanOutput(
-        artifacts=artifacts,
-        mode=mode,
-        decision_trace=payload["decision_trace"],
-    ).model_dump()
-
-
-def _file_content_payload(
-    mode: ModelMode,
-    fallback_reason: str | None,
-    idea: str,
-    prompt: str,
-) -> dict:
-    requested = _extract_json_section(prompt, "Requested file:\n")
-    requested_name = str(requested.get("name") or "README.md")
-    title = _project_title(idea, prompt)
-    resolved_stack = _extract_resolved_stack_summary(prompt)
-    repo_plan = _extract_json_section(prompt, "Repo plan:\n")
-    source_warnings = _source_warnings(prompt)
-    artifacts = build_project_artifacts(
-        idea=idea,
-        title=title,
-        resolved_stack=resolved_stack,
-        repo_plan=repo_plan,
-        source_warnings=source_warnings,
-    )
-    selected = next(
-        (artifact for artifact in artifacts if artifact["name"] == requested_name),
-        {
-            "name": requested_name,
-            "kind": requested.get("kind") or "text",
-            "summary": requested.get("summary") or "Generated MVP file.",
-            "content": requested.get("summary") or "Generated MVP file.\n",
-        },
-    )
-    return GeneratedFileOutput(
-        name=str(selected["name"]),
-        kind=str(selected["kind"]),
-        summary=str(selected["summary"]),
-        content=str(selected["content"]),
-        mode=mode,
-        decision_trace=_trace(
-            mode,
-            fallback_reason,
-            [
-                f"Generated full content for {selected['name']}.",
-                "Kept file content coordinated with the planned repository structure.",
-            ],
-        ),
-    ).model_dump()
-
-
-def _blocker_analysis_payload(mode: ModelMode, fallback_reason: str | None, idea: str) -> dict:
+    del prompt
     label = _idea_label(idea)
     return BlockerAnalysisOutput(
-        blocker_type="missing_demo_dependency",
+        blocker_type="repo_health_recovery",
         severity="medium",
         recoverable=True,
         root_cause=(
-            "The generated package references a demo dependency before the mock "
-            "build adapter has a matching stub."
+            "Repository health verification found a missing or incomplete generated artifact "
+            "after the full project package was committed."
         ),
         recovery_plan=[
             "Classify the build result as recoverable.",
-            "Apply the deterministic dependency stub patch.",
+            "Regenerate or patch only the missing project-specific artifact.",
             "Run build verification again before final packaging.",
         ],
         decision_trace=_trace(
@@ -795,7 +1018,7 @@ def _blocker_analysis_payload(mode: ModelMode, fallback_reason: str | None, idea
                 f"Kept blocker analysis tied to the submitted idea: {label}.",
                 "Read the build tool result before applying recovery.",
                 "Chose a minimal recovery because the repo plan is otherwise sound.",
-                "Kept the blocker visible as proof of autonomous error handling.",
+                "Kept the blocker visible as proof of autonomous validation and recovery.",
             ],
         ),
     ).model_dump()
@@ -815,15 +1038,15 @@ def _final_readme_payload(
         title=title,
         content=(
             f"# {title}\n\n"
-            f"MVPilot turned this submitted idea into a small demo package: {idea}\n\n"
+            f"MVPilot turned this submitted idea into a complete generated software project: {idea}\n\n"
             f"Resolved stack: {resolved_stack}.\n\n"
-            "The package includes scoped requirements, generated artifacts, build "
-            "verification, blocker recovery, and a judge-ready final summary."
+            "The package includes expanded requirements, architecture, source files, API/data plans, "
+            "tests, setup instructions, deployment guidance, validation evidence, and a final project report."
             f"{warning_note}"
         ),
         setup_steps=[
             "Install dependencies.",
-            "Run the FastAPI backend in mock mode.",
+            "Run the FastAPI backend.",
             "Submit the idea through the dashboard.",
         ],
         decision_trace=_trace(
@@ -832,7 +1055,7 @@ def _final_readme_payload(
             [
                 f"Summarized the workflow around {title}.",
                 f"Included resolved stack summary: {resolved_stack}.",
-                "Included setup steps that work without live external services.",
+                "Included setup, testing, and deployment steps for a complete project handoff.",
             ],
         ),
     ).model_dump()
@@ -848,26 +1071,26 @@ def _demo_script_payload(
     warning_summary = _source_warning_summary(prompt)
     warning_note = f" Mention source warnings: {warning_summary}." if warning_summary else ""
     return DemoScriptOutput(
-        title=f"Three-minute {title} demo",
+        title=f"Three-minute {title} walkthrough",
         content=(
             f"Open with the submitted idea: {idea}. "
-            "Show MVPilot retrieving context, scoping the MVP, generating repo "
-            "artifacts, hitting a build blocker, applying recovery, and ending "
-            "with README, script, and pitch content."
+            "Show MVPilot retrieving context, expanding requirements, designing architecture, "
+            "generating project files, validating the codebase, committing to GitHub, and ending "
+            "with README, architecture, testing, deployment, and report content."
             f"{warning_note}"
         ),
         beats=[
             "Enter the project idea.",
             "Watch the graph trace fill with model-backed decisions.",
-            "Show the recoverable build blocker and recovery step.",
-            "Close on the generated package and pitch.",
+            "Show validation and any explicit degraded-mode integrations.",
+            "Close on the generated repository and project report.",
         ],
         decision_trace=_trace(
             mode,
             fallback_reason,
             [
                 f"Built the script around observable {title} dashboard moments.",
-                "Kept the blocker in the story instead of hiding it.",
+                "Kept validation and delivery evidence visible instead of hiding generation work.",
             ],
         ),
     ).model_dump()
@@ -883,21 +1106,21 @@ def _pitch_payload(
     title = _project_title(idea, prompt)
     warning_summary = _source_warning_summary(prompt)
     content = (
-        f"MVPilot helps teams move from idea to credible MVP evidence fast. "
-        f"For {title}, {label}, it scopes the workflow, plans "
-        "the repo, generates artifacts, catches a build blocker, recovers, "
-        "and produces the final README, demo script, and pitch."
+        f"MVPilot helps teams move from idea to complete generated software projects. "
+        f"For {title}, {label}, it expands requirements, designs the architecture, "
+        "generates a full codebase, validates the output, and produces README, setup, "
+        "testing, deployment, and project-report evidence."
     )
     if warning_summary:
         content = f"{content} {warning_summary}"
     return PitchOutput(
         title=title,
-        tagline="An AI teammate that turns messy hackathon ideas into demo packages.",
+        tagline="A Nemotron-powered project studio that turns ideas into committed full-stack repositories.",
         content=content,
         proof_points=[
             "Stable FastAPI task contracts for frontend integration.",
             "Structured Nemotron-style reasoning on model-backed steps.",
-            "Visible blocker analysis and recovery before final packaging.",
+            "Visible validation and recovery before final packaging.",
         ],
         decision_trace=_trace(
             mode,

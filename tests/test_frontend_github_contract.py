@@ -16,7 +16,7 @@ def test_frontend_uses_backend_owned_github_oauth_flow():
     assert "repoPreference" in source
     assert "repoDescription" in source
     assert "github_connection_id" in source
-    assert "Agent Activity Log" in source
+    assert "Activity log" in source
     assert "githubToken" not in source
     assert "github_auth_code" not in source
     assert "GITHUB_TOKEN" not in source

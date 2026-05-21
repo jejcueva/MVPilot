@@ -38,6 +38,7 @@ ResolvedTechStackSource = Literal[
     "request_preference",
     "default",
     "mixed",
+    "stack_recommendation",
 ]
 
 

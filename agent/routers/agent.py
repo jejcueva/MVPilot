@@ -151,6 +151,25 @@ async def _read_form_payload(request: Request) -> dict[str, Any]:
             form.get("github_auth_code") or _truthy_form_value(form.get("github_connected"))
         ),
         "github_connection_id": form.get("github_connection_id"),
+        "target_users": form.get("target_users") or form.get("targetUsers"),
+        "tech_stack_preference": form.get("tech_stack_preference") or form.get("techStackPreference"),
+        "required_features": _form_text_list(form, "required_features")
+        + _form_text_list(form, "requiredFeatures"),
+        "project_depth": form.get("project_depth")
+        or form.get("projectDepth")
+        or "Advanced Project",
+        "target_platform": form.get("target_platform")
+        or form.get("targetPlatform")
+        or "web app",
+        "use_openclaw_orchestration": (
+            _truthy_form_value(
+                form.get("use_openclaw_orchestration")
+                or form.get("useOpenClawOrchestration")
+            )
+            if form.get("use_openclaw_orchestration") is not None
+            or form.get("useOpenClawOrchestration") is not None
+            else True
+        ),
     }
     return _normalize_run_payload(payload)
 

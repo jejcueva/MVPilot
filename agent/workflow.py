@@ -1,10 +1,9 @@
 from __future__ import annotations
 
-import asyncio
 import operator
 import json
 from datetime import UTC, datetime
-from typing import Annotated, Any, Awaitable, Callable, Literal, NotRequired, TypedDict
+from typing import Annotated, Any, Literal, NotRequired, TypedDict
 
 from langgraph.graph import END, START, StateGraph
 
@@ -18,24 +17,28 @@ from agent.model_client import (
 from agent.model_outputs import (
     BlockerAnalysisOutput,
     DemoScriptOutput,
-    FilePlanOutput,
     FileManifestOutput,
     FinalReadmeOutput,
-    GeneratedFileOutput,
     MvpScopeOutput,
     PitchOutput,
+    RecommendedStackOutput,
     RepoPlanOutput,
 )
 from agent.prompts import (
     build_blocker_analysis_prompt,
     build_demo_script_prompt,
-    build_file_content_prompt,
-    build_file_plan_prompt,
     build_file_manifest_prompt,
     build_final_readme_prompt,
     build_pitch_prompt,
     build_plan_repo_prompt,
+    build_stack_recommendation_prompt,
     build_scope_mvp_prompt,
+)
+from agent.stack_recommendation import (
+    align_architecture_plan_with_recommended_stack,
+    apply_recommended_stack_to_build_context,
+    recommended_stack_summary,
+    stack_items_from_recommended,
 )
 from agent.schemas import AgentStep
 from agent.adapters import AuditAdapter, RagMemoryAdapter, ToolAdapter, InMemoryAuditAdapter, InMemoryToolAdapter
@@ -44,14 +47,48 @@ from agent.frontend_intake import (
     build_optional_params_from_frontend_intake,
     build_source_context,
 )
-from agent.generated_project import merge_with_project_artifacts, title_from_idea
 from agent.github_oauth import GitHubConnectionService, GitHubOAuthError
 from agent.live_adapters import LiveRagMemoryAdapter
-from tools.build_checker import merge_repo_health_scaffold
-from agent.openclaw_runtime import (
-    registered_tools_for_settings,
-    runtime_name_for_settings,
+from agent.idea_context import (
+    features_from_context,
+    project_title_from_context,
+    target_users_from_context,
+    tech_stack_from_context,
 )
+from agent.mvp_depth import enrich_mvp_scope
+from agent.mvp_validation import build_delivery_report, validate_mvp_output
+from agent.openclaw_orchestrator import OpenClawOrchestrator, _planned_file_path
+from agent.orchestration_pipeline import (
+    API_DESIGN,
+    AUTH_AUTHORIZATION_DESIGN,
+    BACKEND_ARCHITECTURE,
+    BUILD_TEST_VALIDATION,
+    CODE_IMPLEMENTATION,
+    DATA_MODEL_DESIGN,
+    DATABASE_SCHEMA_PLANNING,
+    DEPLOYMENT_INSTRUCTIONS,
+    DOCUMENTATION_GENERATION,
+    DOMAIN_RESEARCH,
+    FEATURE_SYSTEM_DESIGN,
+    FILE_TREE_GENERATION,
+    FINAL_PROJECT_REPORT,
+    FRONTEND_ARCHITECTURE,
+    GITHUB_REPO_EXPORT,
+    IDEA_INTAKE,
+    REFERENCE_URL_ANALYSIS,
+    REQUIREMENT_EXPANSION,
+    TESTING_STRATEGY,
+    TECH_STACK_RECOMMENDATION,
+    USER_GOAL_INTERPRETATION,
+    agent_for_node,
+    log_node_activity,
+    record_phases,
+)
+from agent.project_generation import (
+    artifact_groups,
+    hydrate_file_manifest,
+)
+from tools.build_checker import merge_repo_health_scaffold
 from agent.schemas import UploadedSourceFileContent
 
 ListReducer = Annotated[list[dict[str, Any]], operator.add]
@@ -62,9 +99,11 @@ NODE_FLIGHT_STAGE: dict[str, str] = {
     "exchange_github_code": "preflight",
     "retrieve_context": "radar_scan",
     "scope_mvp": "flight_plan",
+    "recommend_stack": "flight_plan",
     "plan_repo": "flight_plan",
     "create_repo": "autopilot",
     "generate_files": "autopilot",
+    "validate_mvp": "autopilot",
     "debug_generated_files": "autopilot",
     "commit_progress": "autopilot",
     "verify_build": "autopilot",
@@ -83,6 +122,7 @@ NODE_AGENT: dict[str, str] = {
     "plan_repo": "orchestrator",
     "create_repo": "github",
     "generate_files": "orchestrator",
+    "validate_mvp": "orchestrator",
     "debug_generated_files": "orchestrator",
     "commit_progress": "github",
     "verify_build": "github",
@@ -120,6 +160,7 @@ class WorkflowState(TypedDict):
     repo: NotRequired[dict[str, Any]]
     github_connection: NotRequired[dict[str, Any]]
     mvp_scope: NotRequired[dict[str, Any]]
+    recommended_stack: NotRequired[dict[str, Any]]
     repo_plan: NotRequired[dict[str, Any]]
     file_manifest: NotRequired[dict[str, Any]]
     blocker_analysis: NotRequired[dict[str, Any]]
@@ -128,6 +169,16 @@ class WorkflowState(TypedDict):
     pitch: NotRequired[dict[str, Any]]
     final_report: NotRequired[dict[str, Any] | None]
     failure_reason: NotRequired[str | None]
+    mvp_plan: NotRequired[dict[str, Any]]
+    project_plan: NotRequired[dict[str, Any]]
+    agent_logs: NotRequired[list[dict[str, Any]]]
+    project_agents: NotRequired[list[dict[str, Any]]]
+    build_timeline: NotRequired[list[dict[str, Any]]]
+    openclaw_pipeline: NotRequired[dict[str, Any]]
+    model_modes: ListReducer
+    file_manifest_mode: NotRequired[str]
+    mvp_validation: NotRequired[dict[str, Any]]
+    mvp_delivery: NotRequired[dict[str, Any]]
 
 
 
@@ -143,14 +194,14 @@ def build_initial_state(
     uploaded_file_contents: list[dict[str, Any]] | None = None,
 ) -> WorkflowState:
     normalized_intake = frontend_intake or FrontendIntake(idea=idea).model_dump()
+    orchestrator = OpenClawOrchestrator(settings)
     return {
         "task_id": task_id,
         "idea": idea,
         "repo_visibility": repo_visibility,
         "demo_mode": demo_mode,
         "source_urls": list(source_urls or []),
-        "runtime": runtime_name_for_settings(settings),
-        "registered_tools": registered_tools_for_settings(settings),
+        **orchestrator.initial_state_extras(),
         "openclaw_trace": [],
         "status": "started",
         "nemotron_model": settings.nemotron_model,
@@ -167,6 +218,7 @@ def build_initial_state(
         "generated_artifacts": [],
         "final_report": None,
         "failure_reason": None,
+        "model_modes": [],
     }
 
 
@@ -178,12 +230,13 @@ def build_workflow(
     retrieval: RagMemoryAdapter | None = None,
     tools: ToolAdapter | None = None,
     github_connections: GitHubConnectionService | None = None,
-    progress_callback: Callable[[str, list[AgentStep]], Awaitable[None]] | None = None,
 ):
     active_audit = audit or InMemoryAuditAdapter(model_name=settings.nemotron_fast_model)
     active_model_client = model_client or _build_default_model_client(settings)
+    enforce_live_nemotron = model_client is None and _live_nemotron_workflow(settings)
     active_retrieval = retrieval or LiveRagMemoryAdapter()
     active_tools = tools or InMemoryToolAdapter()
+    orchestrator = OpenClawOrchestrator(settings)
 
     def append_step(
         *,
@@ -217,28 +270,7 @@ def build_workflow(
         prompt_purpose: str | None = None,
         extra_trace: list[str] | None = None,
     ) -> dict[str, list[AgentStep]]:
-        step = build_model_step(
-            state=state,
-            node_name=node_name,
-            message=message,
-            result=result,
-            status=status,
-            prompt_purpose=prompt_purpose,
-            extra_trace=extra_trace,
-        )
-        return {"agent_steps": [step], "graph_trace": [step]}
-
-    def build_model_step(
-        *,
-        state: WorkflowState | None = None,
-        node_name: str,
-        message: str,
-        result: ModelCallResult,
-        status: str = "completed",
-        prompt_purpose: str | None = None,
-        extra_trace: list[str] | None = None,
-    ) -> AgentStep:
-        return AgentStep(
+        step = AgentStep(
             project_id=state["task_id"] if state else None,
             flight_stage=NODE_FLIGHT_STAGE.get(node_name),
             agent=NODE_AGENT.get(node_name),
@@ -254,22 +286,44 @@ def build_workflow(
             ],
             timestamp=datetime.now(UTC),
         )
-
-    async def publish_progress(state: WorkflowState, step: AgentStep) -> None:
-        if progress_callback is not None:
-            await progress_callback(state["task_id"], [step])
+        return {"agent_steps": [step], "graph_trace": [step]}
 
     def receive_idea(state: WorkflowState) -> dict[str, Any]:
-        return append_step(
-            state=state,
-            node_name="receive_idea",
-            message="Received the idea and initialized the Person 1 workflow.",
-            decision_trace=[
-                "Accepted the trimmed idea payload.",
-                "Kept endpoint response shape unchanged.",
-                f"Demo mode is {state['demo_mode']}.",
-            ],
-        )
+        intake = state.get("frontend_intake") or {}
+        return {
+            **append_step(
+                state=state,
+                node_name="receive_idea",
+                message=f"{agent_for_node('receive_idea')} captured the project idea and intake brief.",
+                decision_trace=[
+                    "Accepted the trimmed idea payload.",
+                    f"Runtime: {state.get('runtime', 'langgraph')}.",
+                    f"Target users: {intake.get('targetUsers') or 'not specified'}.",
+                    f"Tech preference: {intake.get('techStackPreference') or 'auto-selected'}.",
+                ],
+            ),
+            **orchestrator.record_phase(
+                state,
+                phase_id=IDEA_INTAKE,
+                status="completed",
+                detail="Parsed the startup idea, optional reference URL, and feature constraints.",
+            ),
+            **orchestrator.update_mvp_plan(
+                state,
+                idea=state["idea"],
+                target_users=intake.get("targetUsers"),
+                tech_stack_preference=intake.get("techStackPreference"),
+                reference_url=intake.get("primaryRulesUrl"),
+                project_depth=intake.get("projectDepth") or intake.get("project_depth"),
+                target_platform=intake.get("targetPlatform") or intake.get("target_platform"),
+            ),
+            **log_node_activity(
+                state=state,
+                node_name="receive_idea",
+                stage_id=IDEA_INTAKE,
+                message="Project intake recorded.",
+            ),
+        }
 
     async def exchange_github_code(state: WorkflowState) -> dict[str, Any]:
         frontend_intake = FrontendIntake.model_validate(
@@ -282,10 +336,10 @@ def build_workflow(
                 **append_step(
                     state=state,
                     node_name="exchange_github_code",
-                    message="Mock mode skipped live GitHub OAuth exchange.",
+                    message="Test mode skipped live GitHub OAuth exchange.",
                     decision_trace=[
-                        "Mock mode keeps the workflow deterministic.",
-                        "No GitHub code or token is required for mock repository actions.",
+                        "Test mode keeps the workflow deterministic.",
+                        "No GitHub code or token is required for in-memory repository actions.",
                     ],
                 ),
                 "github_connection": {
@@ -477,6 +531,28 @@ def build_workflow(
             "build_context": build_context,
             "retrieved_docs": docs,
             "memory_matches": memories,
+            **record_phases(
+                orchestrator,
+                state,
+                (
+                    DOMAIN_RESEARCH,
+                    "completed",
+                    f"Retrieved {evidence_count} evidence chunks and {len(memories)} memory matches.",
+                    [str(doc.get("source", "")) for doc in docs[:4] if doc.get("source")],
+                ),
+                (
+                    REFERENCE_URL_ANALYSIS,
+                    "completed",
+                    f"Analyzed intake sources with {source_context['sourceCounts']['warnings']} warning(s).",
+                    list(source_urls[:4]),
+                ),
+            ),
+            **log_node_activity(
+                state=state,
+                node_name="retrieve_context",
+                stage_id=DOMAIN_RESEARCH,
+                message="Research/RAG Agent enriched build context.",
+            ),
         }
 
     async def scope_mvp(state: WorkflowState) -> dict[str, Any]:
@@ -489,18 +565,123 @@ def build_workflow(
                 memory_matches=state["memory_matches"],
             ),
             response_model=MvpScopeOutput,
-            max_tokens=4000,
-            reasoning_effort="medium",
+            max_tokens=settings.nemotron_planning_max_tokens,
+            reasoning_effort=settings.nemotron_reasoning_effort,
         )
-        scope = result.output.model_dump()
+        _require_live_nemotron_result(
+            result, "scope_mvp", enforced=enforce_live_nemotron, settings=settings
+        )
+        scope = enrich_mvp_scope(
+            result.output.model_dump(),
+            idea=state["idea"],
+            intake=state.get("frontend_intake"),
+        )
+        project_plan = orchestrator.compose_project_plan(
+            idea=state["idea"],
+            intake=state.get("frontend_intake"),
+            mvp_scope=scope,
+            repo_plan=state.get("repo_plan"),
+            build_context=state.get("build_context"),
+            recommended_stack=state.get("recommended_stack"),
+        )
         return {
             **append_model_step(
                 state=state,
                 node_name="scope_mvp",
-                message="Scoped the MVP to one judge-friendly workflow.",
+                message="Expanded requirements for a full complex project.",
                 result=result,
             ),
             "mvp_scope": scope,
+            "mvp_plan": project_plan,
+            "project_plan": project_plan,
+            "model_modes": [result.mode],
+            **record_phases(
+                orchestrator,
+                state,
+                (
+                    REQUIREMENT_EXPANSION,
+                    "completed",
+                    f"Defined {len(project_plan.get('features') or [])} core project features.",
+                    [str(item) for item in (project_plan.get("features") or [])[:6]],
+                ),
+                (
+                    USER_GOAL_INTERPRETATION,
+                    "completed",
+                    f"Target users: {project_plan.get('target_users') or 'inferred from idea'}.",
+                    [],
+                ),
+                (
+                    FEATURE_SYSTEM_DESIGN,
+                    "completed",
+                    f"Archetype: {scope.get('project_archetype') or scope.get('vertical_pack')}.",
+                    list(scope.get("api_routes") or [])[:6],
+                ),
+            ),
+            **log_node_activity(
+                state=state,
+                node_name="scope_mvp",
+                stage_id=REQUIREMENT_EXPANSION,
+                message="Product Strategist Agent expanded project requirements.",
+            ),
+        }
+
+    async def recommend_stack(state: WorkflowState) -> dict[str, Any]:
+        build_context = dict(state.get("build_context") or {})
+        result = await active_model_client.complete_structured(
+            purpose="recommend_stack",
+            model=settings.nemotron_model,
+            prompt=build_stack_recommendation_prompt(
+                idea=state["idea"],
+                project_requirements=state.get("mvp_scope", {}),
+                build_context=build_context,
+            ),
+            response_model=RecommendedStackOutput,
+            max_tokens=settings.nemotron_max_tokens_for("recommend_stack"),
+            reasoning_effort=settings.nemotron_reasoning_effort,
+        )
+        _require_live_nemotron_result(
+            result, "recommend_stack", enforced=enforce_live_nemotron, settings=settings
+        )
+        recommended = result.output.model_dump()
+        build_context = apply_recommended_stack_to_build_context(build_context, recommended)
+        project_plan = orchestrator.compose_project_plan(
+            idea=state["idea"],
+            intake=state.get("frontend_intake"),
+            mvp_scope=state.get("mvp_scope"),
+            repo_plan=state.get("repo_plan"),
+            build_context=build_context,
+            recommended_stack=recommended,
+        )
+        stack_summary = recommended_stack_summary(recommended)
+        stack_artifacts = stack_items_from_recommended(recommended)[:8]
+        return {
+            **append_model_step(
+                state=state,
+                node_name="recommend_stack",
+                message="Stack Selector Agent recommended a project-specific tech stack.",
+                result=result,
+            ),
+            "recommended_stack": recommended,
+            "build_context": build_context,
+            "mvp_plan": project_plan,
+            "project_plan": project_plan,
+            "model_modes": [result.mode],
+            **record_phases(
+                orchestrator,
+                state,
+                (
+                    TECH_STACK_RECOMMENDATION,
+                    "completed",
+                    stack_summary[:240],
+                    stack_artifacts,
+                ),
+            ),
+            **log_node_activity(
+                state=state,
+                node_name="recommend_stack",
+                stage_id=TECH_STACK_RECOMMENDATION,
+                message="Stack Selector Agent aligned stack with hackathon rules and project scope.",
+            ),
         }
 
     async def plan_repo(state: WorkflowState) -> dict[str, Any]:
@@ -509,22 +690,87 @@ def build_workflow(
             model=settings.nemotron_model,
             prompt=build_plan_repo_prompt(
                 idea=state["idea"],
-                mvp_scope=state.get("mvp_scope", {}),
+                project_requirements=state.get("mvp_scope", {}),
                 build_context=state.get("build_context", {}),
             ),
             response_model=RepoPlanOutput,
-            max_tokens=8000,
-            reasoning_effort="medium",
+            max_tokens=settings.nemotron_max_tokens_for("plan_repo"),
+            reasoning_effort=settings.nemotron_reasoning_effort,
         )
-        plan = result.output.model_dump()
+        _require_live_nemotron_result(
+            result, "plan_repo", enforced=enforce_live_nemotron, settings=settings
+        )
+        plan = align_architecture_plan_with_recommended_stack(
+            result.output.model_dump(),
+            state.get("recommended_stack"),
+        )
+        project_plan = orchestrator.compose_project_plan(
+            idea=state["idea"],
+            intake=state.get("frontend_intake"),
+            mvp_scope=state.get("mvp_scope"),
+            repo_plan=plan,
+            build_context=state.get("build_context"),
+            recommended_stack=state.get("recommended_stack"),
+        )
+        timeline_updates = record_phases(
+            orchestrator,
+            state,
+            (
+                DATA_MODEL_DESIGN,
+                "completed",
+                "Designed entities, relationships, and persistence boundaries.",
+                list(plan.get("data_model") or [])[:6],
+            ),
+            (
+                API_DESIGN,
+                "completed",
+                "Mapped REST routes and service contracts.",
+                list(plan.get("api_design") or plan.get("api_routes") or [])[:6],
+            ),
+            (
+                FRONTEND_ARCHITECTURE,
+                "completed",
+                "Planned pages, components, and client state.",
+                list(plan.get("frontend_architecture") or [])[:6],
+            ),
+            (
+                BACKEND_ARCHITECTURE,
+                "completed",
+                "Planned services, modules, and integrations.",
+                list(plan.get("backend_architecture") or [])[:6],
+            ),
+            (
+                AUTH_AUTHORIZATION_DESIGN,
+                "completed",
+                "Defined authentication and authorization approach.",
+                list(plan.get("auth_design") or [])[:6],
+            ),
+            (
+                DATABASE_SCHEMA_PLANNING,
+                "completed",
+                "Outlined SQL schema and migration strategy.",
+                list(plan.get("database_schema") or [])[:6],
+            ),
+        )
+        plan_message = "Planned full project architecture and repository layout."
+        if result.mode != "live":
+            reason = result.fallback_reason or "Nemotron unavailable"
+            plan_message = (
+                f"Planned architecture via {result.mode} fallback ({reason}). "
+                "Continuing pipeline; file manifest still requires live Nemotron when configured."
+            )
         return {
             **append_model_step(
                 state=state,
                 node_name="plan_repo",
-                message="Planned the generated repository package.",
+                message=plan_message,
                 result=result,
             ),
             "repo_plan": plan,
+            "mvp_plan": project_plan,
+            "project_plan": project_plan,
+            "model_modes": [result.mode],
+            **timeline_updates,
         }
 
     def create_repo(state: WorkflowState) -> dict[str, Any]:
@@ -559,10 +805,15 @@ def build_workflow(
                         else "Used the connected GitHub account for the requested repo action."
                     ),
                     f"Repository preference: {frontend_intake.repoPreference}.",
-                    (
-                        "Stored repo metadata for later commit steps."
+                    *(
+                        [
+                            f"Repository target: {tool_call.get('repo', {}).get('name')}.",
+                            tool_call.get("summary", ""),
+                        ]
                         if tool_call["status"] == "success"
-                        else "Repository creation failed; workflow stopped before file generation."
+                        else [
+                            "Repository creation failed; workflow stopped before file generation.",
+                        ]
                     ),
                 ],
             ),
@@ -574,170 +825,188 @@ def build_workflow(
         if tool_call["status"] != "success":
             update["status"] = "failed"
             update["failure_reason"] = tool_call["summary"]
+        else:
+            update.update(
+                orchestrator.record_phase(
+                    state,
+                    phase_id=GITHUB_REPO_EXPORT,
+                    status="completed",
+                    detail=tool_call["summary"],
+                    artifacts=[str(tool_call.get("repo", {}).get("name") or repo_name)],
+                )
+            )
         return update
 
     async def generate_files(state: WorkflowState) -> dict[str, Any]:
-        progress_steps: list[AgentStep] = []
-        plan_result = await active_model_client.complete_structured(
-            purpose="file_plan",
-            model=settings.nemotron_model,
-            prompt=build_file_plan_prompt(
+        mvp_scope = state.get("mvp_scope") or {}
+        if not settings.mock_mode and not settings.nvidia_configured:
+            raise RuntimeError(
+                "Live Nemotron file_manifest requires NVIDIA_API_KEY. "
+                "Set the key or use ADAPTER_MODE=mock for deterministic runs."
+            )
+        file_model = settings.nemotron_model
+        result = await active_model_client.complete_structured(
+            purpose="file_manifest",
+            model=file_model,
+            prompt=build_file_manifest_prompt(
                 idea=state["idea"],
-                repo_plan=state.get("repo_plan", {}),
+                project_requirements=mvp_scope,
+                architecture_plan=state.get("repo_plan", {}),
                 build_context=state.get("build_context", {}),
             ),
-            response_model=FilePlanOutput,
-            max_tokens=8000,
-            reasoning_effort="medium",
+            response_model=FileManifestOutput,
+            max_tokens=settings.nemotron_file_manifest_max_tokens,
+            reasoning_effort=settings.nemotron_reasoning_effort,
         )
-        plan_step = build_model_step(
-            state=state,
-            node_name="generate_files",
-            message="Planned generated repo files.",
-            result=plan_result,
-            status="running",
-            prompt_purpose="file_plan",
-            extra_trace=[
-                "Next step: generate each planned file as a separate model call.",
-            ],
+        _require_live_nemotron_result(
+            result, "file_manifest", enforced=enforce_live_nemotron, settings=settings
         )
-        progress_steps.append(plan_step)
-        await publish_progress(state, plan_step)
-        plan = plan_result.output.model_dump()
-        planned_artifacts = [
-            {
-                key: value
-                for key, value in artifact.items()
-                if key in {"name", "kind", "summary"}
-            }
-            for artifact in plan["artifacts"][:16]
-        ]
-        async def generate_one_file(artifact: dict[str, Any]) -> ModelCallResult:
-            file_name = str(artifact.get("name") or "unknown file")
-            start_step = AgentStep(
-                project_id=state["task_id"],
-                flight_stage=NODE_FLIGHT_STAGE.get("generate_files"),
-                agent=NODE_AGENT.get("generate_files"),
-                node_name="generate_files",
-                status="running",
-                message=f"Generating {file_name}.",
-                model=settings.nemotron_model,
-                prompt_purpose="file_content",
-                model_mode=None,
-                decision_trace=[
-                    f"Started one-file generation for {file_name}.",
-                    "This progress event is emitted before the model call returns.",
-                ],
-                timestamp=datetime.now(UTC),
-            )
-            progress_steps.append(start_step)
-            await publish_progress(state, start_step)
-            file_result = await active_model_client.complete_structured(
-                purpose="file_content",
-                model=settings.nemotron_model,
-                prompt=build_file_content_prompt(
-                    idea=state["idea"],
-                    repo_plan=state.get("repo_plan", {}),
-                    build_context=state.get("build_context", {}),
-                    artifact=artifact,
-                    file_plan=planned_artifacts,
-                ),
-                response_model=GeneratedFileOutput,
-                max_tokens=10000,
-                reasoning_effort="medium",
-            )
-            file_step = build_model_step(
-                state=state,
-                node_name="generate_files",
-                message=f"Generated {file_result.output.name}.",
-                result=file_result,
-                status="running",
-                prompt_purpose="file_content",
-            )
-            progress_steps.append(file_step)
-            await publish_progress(state, file_step)
-            return file_result
-
-        semaphore = asyncio.Semaphore(3)
-
-        async def generate_one_file_limited(artifact: dict[str, Any]) -> ModelCallResult:
-            async with semaphore:
-                return await generate_one_file(artifact)
-
-        generated_file_results = list(
-            await asyncio.gather(
-                *(generate_one_file_limited(artifact) for artifact in planned_artifacts)
-            )
-        )
-        generated_artifacts = [
-            result.output.model_dump() for result in generated_file_results
-        ]
-        manifest = {
-            "artifacts": generated_artifacts,
-            "mode": _package_mode([plan_result, *generated_file_results]),
-            "decision_trace": [
-                *plan_result.output.decision_trace,
-                *[
-                    f"{result.output.name}: {result.mode}"
-                    for result in generated_file_results
-                ],
-            ],
-        }
-        frontend_intake = FrontendIntake.model_validate(
-            state.get("frontend_intake") or {"idea": state["idea"]}
-        )
-        manifest["artifacts"] = merge_with_project_artifacts(
-            manifest["artifacts"],
+        manifest = result.output.model_dump()
+        build_context = state.get("build_context", {})
+        intake = state.get("frontend_intake") or build_context.get("frontendIntake", {})
+        manifest["artifacts"] = hydrate_file_manifest(
+            manifest.get("artifacts") or [],
             idea=state["idea"],
-            title=frontend_intake.title or title_from_idea(state["idea"]),
-            resolved_stack=_resolved_stack_summary(state.get("build_context", {})),
-            repo_plan=state.get("repo_plan", {}),
-            source_warnings=_source_warnings(state.get("build_context", {})),
+            title=project_title_from_context(idea=state["idea"], intake=intake),
+            resolved_stack=_resolved_stack_summary(build_context),
+            architecture_plan=state.get("repo_plan"),
+            source_warnings=_source_warnings(build_context),
+            target_users=target_users_from_context(intake),
+            required_features=features_from_context(
+                idea=state["idea"],
+                intake=intake,
+                mvp_scope=mvp_scope,
+                repo_plan=state.get("repo_plan"),
+            ),
+            tech_stack_preference=tech_stack_from_context(
+                intake,
+                state.get("repo_plan"),
+            ),
+            project_requirements=mvp_scope,
         )
+        if not manifest["artifacts"]:
+            raise RuntimeError(
+                "Live Nemotron file_manifest returned no usable artifacts."
+            )
+        groups = artifact_groups(manifest["artifacts"])
         artifacts = [
             {
                 **artifact,
-                "mock_mode": manifest["mode"] != "live",
+                "mock_mode": result.mode != "live",
                 "summary": (
                     artifact["summary"]
-                    if manifest["mode"] == "live"
-                    else f"{manifest['mode'].title()} mode: {artifact['summary']}"
+                    if result.mode == "live"
+                    else f"{result.mode.title()} mode: {artifact['summary']}"
                 ),
             }
             for artifact in manifest["artifacts"]
         ]
-        combined_result = ModelCallResult(
-            output=FileManifestOutput.model_validate(manifest),
-            model=settings.nemotron_model,
-            purpose="file_manifest",
-            mode=manifest["mode"],
-            latency_ms=sum(
-                result.latency_ms for result in [plan_result, *generated_file_results]
-            ),
-            fallback_reason=next(
-                (
-                    result.fallback_reason
-                    for result in [plan_result, *generated_file_results]
-                    if result.fallback_reason
-                ),
-                None,
-            ),
+        timeline_updates = orchestrator.record_phase(
+            state,
+            phase_id=FILE_TREE_GENERATION,
+            status="completed",
+            detail=f"Planned {len(manifest['artifacts'])} repository paths for the project.",
+            artifacts=[artifact["name"] for artifact in manifest["artifacts"][:8]],
         )
-        final_step = build_model_step(
-            state=state,
-            node_name="generate_files",
-            message="Generated runnable frontend, backend, database, test, docs, and demo files.",
-            result=combined_result,
-            extra_trace=[
-                f"Generated {len(generated_file_results)} file content payload(s) individually.",
-            ],
-        )
+        timeline_updates["build_timeline"] = record_phases(
+            orchestrator,
+            {**state, "build_timeline": timeline_updates["build_timeline"]},
+            (
+                CODE_IMPLEMENTATION,
+                "completed",
+                f"Generated {len(groups['frontend'])} frontend and {len(groups['backend'])} backend file(s).",
+                (groups["frontend"] + groups["backend"])[:8],
+            ),
+            (
+                DOCUMENTATION_GENERATION,
+                "completed",
+                f"Added {len(groups['docs']) + len(groups['tests'])} documentation and test artifacts.",
+                (groups["docs"] + groups["tests"])[:8],
+            ),
+        )["build_timeline"]
         return {
-            "agent_steps": [*progress_steps, final_step],
-            "graph_trace": [*progress_steps, final_step],
+            **append_model_step(
+                state=state,
+                node_name="generate_files",
+                message="Generated runnable frontend, backend, database, test, docs, and idea-specific walkthrough files.",
+                result=result,
+            ),
             "generated_artifacts": artifacts,
             "file_manifest": manifest,
+            "file_manifest_mode": result.mode,
+            "model_modes": [result.mode],
+            **timeline_updates,
         }
+
+    def validate_mvp(state: WorkflowState) -> dict[str, Any]:
+        frontend_intake = state.get("frontend_intake") or {}
+        original_modes = list(state.get("model_modes") or [])
+        modes = original_modes[:]
+        enriched_scope = enrich_mvp_scope(
+            state.get("mvp_scope") or {},
+            idea=state["idea"],
+            intake=frontend_intake,
+        )
+        artifacts = list(state.get("generated_artifacts", []))
+        validation = validate_mvp_output(
+            idea=state["idea"],
+            intake=frontend_intake,
+            mvp_scope=enriched_scope,
+            repo_plan=state.get("repo_plan"),
+            generated_artifacts=artifacts,
+            model_modes=modes,
+            require_live_manifest=enforce_live_nemotron,
+            manifest_model_mode=state.get("file_manifest_mode"),
+        )
+
+        delivery = build_delivery_report(
+            idea=state["idea"],
+            intake=frontend_intake,
+            mvp_scope=state.get("mvp_scope"),
+            validation=validation,
+            model_modes=modes,
+            generated_artifacts=artifacts,
+        )
+        status = "completed" if validation["passed"] else "failed"
+        if validation["passed"]:
+            message = "Project output validated against requirements and architecture."
+        else:
+            failed_checks = [
+                check["detail"]
+                for check in validation.get("checks", [])
+                if not check.get("passed")
+            ]
+            message = failed_checks[0] if failed_checks else (
+                "Project validation failed before GitHub export."
+            )
+        update = {
+            **append_step(
+                state=state,
+                node_name="validate_mvp",
+                status=status,
+                message=message,
+                decision_trace=[
+                    f"Validation passed: {validation['passed']}",
+                    f"Model modes used: {', '.join(modes) or 'unknown'}",
+                    "Validated Nemotron manifest only (no scaffold merge or repair).",
+                    *(validation.get("warnings") or [])[:3],
+                ],
+            ),
+            "mvp_validation": validation,
+            "mvp_delivery": delivery,
+            "model_modes": [mode for mode in modes if mode not in original_modes],
+            **orchestrator.record_phase(
+                state,
+                phase_id=TESTING_STRATEGY,
+                status=status,
+                detail=message,
+                artifacts=[check["name"] for check in validation.get("checks", []) if check.get("passed")][:8],
+            ),
+        }
+        if not validation["passed"]:
+            update["status"] = "failed"
+            update["failure_reason"] = message
+        return update
 
     def debug_generated_files(state: WorkflowState) -> dict[str, Any]:
         debug_report = _debug_generated_artifacts(state["generated_artifacts"])
@@ -766,12 +1035,18 @@ def build_workflow(
                     "Added docs/DEBUG_REPORT.md to make the debug pass visible in the repo.",
                 ],
             ),
-            "generated_artifacts": [debug_artifact],
+            "generated_artifacts": [*state["generated_artifacts"], debug_artifact],
         }
 
     def commit_progress(state: WorkflowState) -> dict[str, Any]:
-        repo_name = state.get("repo", {}).get("name", "mvpilot-demo")
-        files = merge_repo_health_scaffold(_files_from_generated_artifacts(state["generated_artifacts"]))
+        repo_name = state.get("repo", {}).get("name") or f"mvpilot-generated-{state['task_id'][:8]}"
+        files = _files_from_generated_artifacts(state["generated_artifacts"])
+        frontend_intake = state.get("frontend_intake") or {}
+        files = merge_repo_health_scaffold(
+            files,
+            idea=state["idea"],
+            title=project_title_from_context(idea=state["idea"], intake=frontend_intake),
+        )
         tool_call = active_tools.commit_files(
             repo_name=repo_name,
             files=files,
@@ -798,6 +1073,16 @@ def build_workflow(
         if tool_call["status"] != "success":
             update["status"] = "failed"
             update["failure_reason"] = tool_call["summary"]
+        else:
+            update.update(
+                orchestrator.record_phase(
+                state,
+                phase_id=GITHUB_REPO_EXPORT,
+                status="running",
+                detail=tool_call["summary"],
+                artifacts=[_planned_file_path(item) for item in files[:8] if item],
+                )
+            )
         return update
 
     def verify_build(state: WorkflowState) -> dict[str, Any]:
@@ -826,12 +1111,26 @@ def build_workflow(
             "openclaw_trace": _openclaw_trace_from_tool_call(tool_call),
             "last_tool_result": tool_call,
         }
-        if tool_call["status"] != "success":
-            update["failure_reason"] = (
+        phase_status = "completed" if tool_call["status"] == "success" else "failed"
+        phase_detail = (
+            tool_call["summary"]
+            if tool_call["status"] == "success"
+            else (
                 tool_call.get("error")
                 or tool_call.get("summary")
                 or "Generated repository health check failed."
             )
+        )
+        if tool_call["status"] != "success":
+            update["failure_reason"] = phase_detail
+        update.update(
+            orchestrator.record_phase(
+                state,
+                phase_id=BUILD_TEST_VALIDATION,
+                status=phase_status,
+                detail=phase_detail,
+            )
+        )
         return update
 
     async def handle_blocker(state: WorkflowState) -> dict[str, Any]:
@@ -843,8 +1142,11 @@ def build_workflow(
                 tool_result=state.get("last_tool_result", {}),
             ),
             response_model=BlockerAnalysisOutput,
-            max_tokens=4000,
-            reasoning_effort="medium",
+            max_tokens=900,
+            reasoning_effort=settings.nemotron_reasoning_effort,
+        )
+        _require_live_nemotron_result(
+            result, "blocker_analysis", enforced=enforce_live_nemotron, settings=settings
         )
         blocker_analysis = result.output.model_dump()
         tool_call = active_tools.recover_build()
@@ -852,7 +1154,7 @@ def build_workflow(
             **append_model_step(
                 state=state,
                 node_name="handle_blocker",
-                message="Recovered from the mock build blocker.",
+                message="Applied an idea-specific recovery for the repository health blocker.",
                 result=result,
             ),
             "blocker_recovered": True,
@@ -868,14 +1170,14 @@ def build_workflow(
             model=settings.nemotron_model,
             prompt=build_final_readme_prompt(
                 idea=state["idea"],
-                mvp_scope=state.get("mvp_scope", {}),
-                repo_plan=state.get("repo_plan", {}),
+                project_requirements=state.get("mvp_scope", {}),
+                architecture_plan=state.get("repo_plan", {}),
                 generated_artifacts=state["generated_artifacts"],
                 build_context=state.get("build_context", {}),
             ),
             response_model=FinalReadmeOutput,
-            max_tokens=4000,
-            reasoning_effort="medium",
+            max_tokens=1400,
+            reasoning_effort=settings.nemotron_reasoning_effort,
         )
         demo_result = await active_model_client.complete_structured(
             purpose="demo_script",
@@ -886,8 +1188,8 @@ def build_workflow(
                 build_context=state.get("build_context", {}),
             ),
             response_model=DemoScriptOutput,
-            max_tokens=3000,
-            reasoning_effort="medium",
+            max_tokens=1100,
+            reasoning_effort=settings.nemotron_reasoning_effort,
         )
         pitch_result = await active_model_client.complete_structured(
             purpose="pitch",
@@ -895,13 +1197,21 @@ def build_workflow(
             prompt=build_pitch_prompt(
                 idea=state["idea"],
                 final_readme=readme_result.output.model_dump(),
-                demo_script=demo_result.output.model_dump(),
+                walkthrough=demo_result.output.model_dump(),
                 build_context=state.get("build_context", {}),
             ),
             response_model=PitchOutput,
-            max_tokens=3000,
-            reasoning_effort="medium",
+            max_tokens=1100,
+            reasoning_effort=settings.nemotron_reasoning_effort,
         )
+        for label, model_result in (
+            ("final_readme", readme_result),
+            ("demo_script", demo_result),
+            ("pitch", pitch_result),
+        ):
+            _require_live_nemotron_result(
+                model_result, label, enforced=enforce_live_nemotron, settings=settings
+            )
         package_mode = _package_mode([readme_result, demo_result, pitch_result])
         readme = readme_result.output.model_dump()
         demo_script = demo_result.output.model_dump()
@@ -926,8 +1236,8 @@ def build_workflow(
             "links": links,
             "github_result": last_commit or None,
             "summary": (
-                f"{package_mode.title()} mode: Person 1 workflow produced a scoped MVP package with "
-                "retrieval context, generated artifacts, and recovered build proof."
+                f"{package_mode.title()} orchestration produced a scoped MVP package with "
+                "retrieval context, generated artifacts, validation results, and GitHub delivery proof."
             ),
             "readme": readme,
             "demo_script": demo_script,
@@ -962,6 +1272,29 @@ def build_workflow(
                 or pitch_result.fallback_reason
             ),
         )
+        timeline_updates = orchestrator.record_phase(
+            state,
+            phase_id=DEPLOYMENT_INSTRUCTIONS,
+            status="completed",
+            detail="Added docs/DEPLOY.md with deployment instructions for the generated repo.",
+            artifacts=["docs/DEPLOY.md"],
+        )
+        timeline_updates["build_timeline"] = record_phases(
+            orchestrator,
+            {**state, "build_timeline": timeline_updates["build_timeline"]},
+            (
+                DOCUMENTATION_GENERATION,
+                "completed",
+                "Packaged README, walkthrough, and pitch documentation.",
+                ["README.md", "demo/demo_script.md"],
+            ),
+            (
+                FINAL_PROJECT_REPORT,
+                "completed",
+                "Published final project report and landing-zone links.",
+                ["final_report.json", links.get("buildLogPath") or "docs/BUILD_LOG.md"],
+            ),
+        )["build_timeline"]
         return {
             **append_model_step(
                 state=state,
@@ -979,7 +1312,14 @@ def build_workflow(
             "final_readme": readme,
             "demo_script": demo_script,
             "pitch": pitch,
-            "final_report": final_report,
+            "final_report": {
+                **final_report,
+                "mvp_plan": state.get("mvp_plan"),
+                "build_timeline": state.get("build_timeline"),
+                "mvp_delivery": state.get("mvp_delivery"),
+                "mvp_validation": state.get("mvp_validation"),
+            },
+            **timeline_updates,
         }
 
     async def remember_outcome(state: WorkflowState) -> dict[str, Any]:
@@ -1050,7 +1390,7 @@ def build_workflow(
             or (
                 "Unrecoverable mock tool failure."
                 if state["mock_mode"]
-                else "Workflow stopped after an unrecoverable tool failure."
+                else "Workflow stopped after an unrecoverable tool or validation failure."
             )
         )
         final_report = {
@@ -1080,9 +1420,11 @@ def build_workflow(
     graph.add_node("exchange_github_code", exchange_github_code)
     graph.add_node("retrieve_context", retrieve_context)
     graph.add_node("scope_mvp", scope_mvp)
+    graph.add_node("recommend_stack", recommend_stack)
     graph.add_node("plan_repo", plan_repo)
     graph.add_node("create_repo", create_repo)
     graph.add_node("generate_files", generate_files)
+    graph.add_node("validate_mvp", validate_mvp)
     graph.add_node("debug_generated_files", debug_generated_files)
     graph.add_node("commit_progress", commit_progress)
     graph.add_node("verify_build", verify_build)
@@ -1102,7 +1444,8 @@ def build_workflow(
         },
     )
     graph.add_edge("retrieve_context", "scope_mvp")
-    graph.add_edge("scope_mvp", "plan_repo")
+    graph.add_edge("scope_mvp", "recommend_stack")
+    graph.add_edge("recommend_stack", "plan_repo")
     graph.add_edge("plan_repo", "create_repo")
     graph.add_conditional_edges(
         "create_repo",
@@ -1112,7 +1455,15 @@ def build_workflow(
             "failed": "failed",
         },
     )
-    graph.add_edge("generate_files", "debug_generated_files")
+    graph.add_edge("generate_files", "validate_mvp")
+    graph.add_conditional_edges(
+        "validate_mvp",
+        route_after_validate_mvp,
+        {
+            "debug_generated_files": "debug_generated_files",
+            "failed": "failed",
+        },
+    )
     graph.add_edge("debug_generated_files", "commit_progress")
     graph.add_conditional_edges(
         "commit_progress",
@@ -1145,12 +1496,43 @@ def _build_default_model_client(settings: Settings) -> ModelClient:
     return NemotronModelClient(settings)
 
 
-def _package_mode(results: list[ModelCallResult]) -> Literal["mock", "live", "fallback"]:
+def _live_nemotron_workflow(settings: Settings) -> bool:
+    return not settings.mock_mode
+
+
+def _nemotron_purpose_requires_live(purpose: str, settings: Settings) -> bool:
+    if settings.nemotron_strict_live_active:
+        return True
+    if purpose == "file_manifest" and settings.require_live_file_manifest:
+        return True
+    return False
+
+
+def _require_live_nemotron_result(
+    result: ModelCallResult[Any],
+    purpose: str,
+    *,
+    enforced: bool,
+    settings: Settings,
+) -> None:
+    if not enforced:
+        return
+    if result.mode == "live":
+        return
+    if not _nemotron_purpose_requires_live(purpose, settings):
+        return
+    detail = result.fallback_reason or "non-live model output"
+    raise RuntimeError(
+        f"Live Nemotron is required for {purpose} (got mode={result.mode}). {detail}"
+    )
+
+
+def _package_mode(results: list[ModelCallResult]) -> Literal["mock", "live", "partial"]:
     modes = {result.mode for result in results}
-    if "fallback" in modes:
-        return "fallback"
-    if modes == {"live"}:
+    if "live" in modes:
         return "live"
+    if "partial" in modes:
+        return "partial"
     return "mock"
 
 
@@ -1201,10 +1583,14 @@ def _debug_generated_artifacts(artifacts: list[dict[str, Any]]) -> dict[str, Any
     issues: list[str] = []
     warnings: list[str] = []
 
-    required_paths = ["README.md", "docs/ARCHITECTURE.md", "demo/demo_script.md"]
+    required_paths = ["README.md", "docs/ARCHITECTURE.md"]
     for path in required_paths:
         if path not in paths:
             issues.append(f"Missing required file: `{path}`.")
+    if not any(path in paths for path in ("demo/demo_script.md", "docs/WALKTHROUGH.md")):
+        issues.append(
+            "Missing walkthrough file: `demo/demo_script.md` or `docs/WALKTHROUGH.md`."
+        )
 
     if not any(path in paths for path in ("package.json", "requirements.txt")):
         issues.append("Missing a runnable dependency manifest: `package.json` or `requirements.txt`.")
@@ -1376,6 +1762,15 @@ def route_after_create_repo(state: dict[str, Any]) -> str:
     if state.get("status") == "failed":
         return "failed"
     return "generate_files"
+
+
+def route_after_validate_mvp(state: dict[str, Any]) -> str:
+    if state.get("status") == "failed":
+        return "failed"
+    validation = state.get("mvp_validation") or {}
+    if validation.get("passed") is False:
+        return "failed"
+    return "debug_generated_files"
 
 
 def route_after_commit_progress(state: dict[str, Any]) -> str:

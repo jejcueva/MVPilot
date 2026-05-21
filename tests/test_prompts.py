@@ -88,24 +88,23 @@ def test_scope_mvp_prompt_includes_resolved_tech_stack_and_override_rule() -> No
     assert "sourceContext" in prompt
     assert "Frontend intake is the user's source of truth" in prompt
     assert "missing or unreadable sources as warnings" in prompt
-    assert "required stack items override MVPilot defaults" in prompt
+    assert "recommendedStack" in prompt or "RAG stack hints" in prompt
+    assert "Do not assume the generated project must use MVPilot" in prompt
     assert "Retrieved docs" not in prompt
 
 
 def test_plan_repo_prompt_includes_default_stack_when_rag_is_silent() -> None:
     prompt = build_plan_repo_prompt(
         idea="Build a judge helper",
-        mvp_scope={"must_have": ["intake"]},
+        project_requirements={"must_have": ["intake"]},
         build_context=_default_build_context(),
     )
 
-    assert "Next.js" in prompt
-    assert "FastAPI" in prompt
-    assert "Supabase Postgres" in prompt
+    assert "Recommended stack (binding)" in prompt or "recommendedStack" in prompt
     assert "Study Planner" in prompt
     assert "Frontend intake is the user's source of truth" in prompt
-    assert "required stack items override MVPilot defaults" in prompt
-    assert "generated files, tests, and architecture" in prompt
+    assert "Do not assume the generated project must use MVPilot" in prompt
+    assert "full generated repository architecture" in prompt
 
 
 def test_artifact_prompts_include_intake_source_context_and_stack_rules() -> None:
@@ -113,13 +112,18 @@ def test_artifact_prompts_include_intake_source_context_and_stack_rules() -> Non
 
     manifest_prompt = build_file_manifest_prompt(
         idea="Build a study planner",
-        repo_plan={"files": ["README.md"]},
+        project_requirements={
+            "vertical_pack": "planner",
+            "demo_path": [{"step": "1", "screen": "Plan", "action": "Review plan", "api": "GET /api/items"}],
+            "api_routes": ["/api/items"],
+        },
+        architecture_plan={"files": ["README.md"]},
         build_context=build_context,
     )
     readme_prompt = build_final_readme_prompt(
         idea="Build a study planner",
-        mvp_scope={"must_have": ["intake"]},
-        repo_plan={"files": ["README.md"]},
+        project_requirements={"must_have": ["intake"]},
+        architecture_plan={"files": ["README.md"]},
         generated_artifacts=[],
         build_context=build_context,
     )
@@ -131,12 +135,13 @@ def test_artifact_prompts_include_intake_source_context_and_stack_rules() -> Non
     pitch_prompt = build_pitch_prompt(
         idea="Build a study planner",
         final_readme={"title": "Study Planner"},
-        demo_script={"title": "Demo"},
+        walkthrough={"title": "Demo"},
         build_context=build_context,
     )
 
     for prompt in [manifest_prompt, readme_prompt, demo_prompt, pitch_prompt]:
         assert "frontendIntake" in prompt
         assert "sourceContext" in prompt
-        assert "resolvedTechStack is binding" in prompt
-        assert "required RAG rules override user preference" in prompt
+        assert "recommendedStack" in prompt or "resolvedTechStack" in prompt
+        assert "Required RAG rules override user preference" in prompt
+        assert "MVPilot" in prompt

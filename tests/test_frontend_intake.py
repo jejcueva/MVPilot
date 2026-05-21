@@ -53,6 +53,12 @@ def test_frontend_intake_normalizes_request_fields() -> None:
         "repoUrl": None,
         "visibility": "public",
         "branch": "main",
+        "targetUsers": None,
+        "techStackPreference": None,
+        "requiredFeatures": [],
+        "projectDepth": "Advanced Project",
+        "targetPlatform": "web app",
+        "useOpenClawOrchestration": True,
     }
 
 

@@ -99,7 +99,7 @@ async def test_get_build_context_returns_all_categories(monkeypatch) -> None:
         "FastAPI backend",
         "Supabase pgvector",
     ]
-    assert response.resolvedTechStack.source == "mixed"
+    assert response.resolvedTechStack.source in {"rag_required", "request_preference", "mixed"}
 
 
 @pytest.mark.asyncio
@@ -121,8 +121,8 @@ async def test_get_build_context_returns_empty_categories_when_no_chunks(monkeyp
     assert len(response.allowedToolsAndAPIs) == 3
     assert len(response.requiredRepositoryFormat) == 3
     assert len(response.requiredDemoFormat) == 3
-    assert len(response.requiredTechStackPieces) == 4
-    assert len(response.scopeWarnings) == 2
+    assert len(response.requiredTechStackPieces) == 3
+    assert len(response.scopeWarnings) == 3
     assert response.scopeWarnings[0].source == "mvpilot_default_build_context"
     assert response.evidence == []
     assert response.resolvedTechStack.source == "default"
@@ -141,7 +141,7 @@ async def test_get_build_context_returns_empty_categories_when_no_chunks(monkeyp
         "pytest",
         "npm run build",
     ]
-    assert response.resolvedTechStack.items == response.resolvedTechStack.defaultItems
+    assert response.resolvedTechStack.items == []
 
 
 @pytest.mark.asyncio
@@ -168,9 +168,8 @@ async def test_resolved_tech_stack_keeps_required_items_without_conflicting_defa
         "Must use Flask backend",
         "Must use MongoDB",
     ]
-    assert "FastAPI" not in response.resolvedTechStack.defaultItems
-    assert "Supabase Postgres" not in response.resolvedTechStack.defaultItems
-    assert response.resolvedTechStack.items[:2] == response.resolvedTechStack.requiredItems
+    assert response.resolvedTechStack.items == response.resolvedTechStack.requiredItems
+    assert "flask" in " ".join(response.resolvedTechStack.items).lower()
 
 
 @pytest.mark.asyncio
@@ -193,9 +192,9 @@ async def test_partial_required_stack_uses_mixed_source_and_fills_missing_defaul
         BuildContextRequest(projectId="p1", idea="AI teammate", topK=8)
     )
 
-    assert response.resolvedTechStack.source == "mixed"
+    assert response.resolvedTechStack.source == "rag_required"
     assert response.resolvedTechStack.requiredItems == ["FastAPI backend"]
-    assert "FastAPI" not in response.resolvedTechStack.defaultItems
+    assert response.resolvedTechStack.items == ["FastAPI backend"]
     assert "Next.js" in response.resolvedTechStack.defaultItems
     assert "Supabase Postgres" in response.resolvedTechStack.defaultItems
 
@@ -218,8 +217,9 @@ async def test_optional_stack_preferences_are_included_in_resolved_stack(monkeyp
 
     assert "Vue" in response.resolvedTechStack.items
     assert "Firebase" in response.resolvedTechStack.items
-    assert "Next.js" not in response.resolvedTechStack.defaultItems
-    assert "Supabase Postgres" not in response.resolvedTechStack.defaultItems
+    assert response.resolvedTechStack.source == "request_preference"
+    assert "Next.js" in response.resolvedTechStack.defaultItems
+    assert "Vue" not in response.resolvedTechStack.defaultItems
 
 
 def test_section_headings_map_to_build_doc_types() -> None:

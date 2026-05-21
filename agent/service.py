@@ -15,6 +15,7 @@ from agent.schemas import (
     TaskStatus,
     TaskDetailResponse,
 )
+from agent.project_session_store import SupabasePersistingTaskStore
 from agent.task_store import InMemoryTaskStore
 from agent.frontend_intake import build_frontend_intake_from_task
 from agent.github_oauth import GitHubConnectionService
@@ -24,7 +25,7 @@ from agent.workflow import build_initial_state, build_workflow
 class AgentService:
     def __init__(
         self,
-        task_store: InMemoryTaskStore,
+        task_store: InMemoryTaskStore | SupabasePersistingTaskStore,
         settings: Settings,
         *,
         github_connections: GitHubConnectionService | None = None,
@@ -94,7 +95,6 @@ class AgentService:
             retrieval=rag,
             audit=audit,
             github_connections=self._github_connections,
-            progress_callback=self._task_store.append_agent_steps,
         )
 
         try:
@@ -153,6 +153,8 @@ class AgentService:
             "openclaw_trace": detail.openclaw_trace,
             "generated_artifacts": detail.generated_artifacts,
             "graph_trace": [*detail.graph_trace, step],
+            "mvp_plan": detail.mvp_plan,
+            "build_timeline": detail.build_timeline,
             "final_report": {
                 "status": "failed",
                 "mode": "mock" if self._settings.mock_mode else "live",

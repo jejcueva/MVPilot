@@ -47,7 +47,7 @@ def test_github_connections_migration_exists_and_contains_security_requirements(
     )
 
     migration_file = None
-    for filename in os.listdir(migrations_dir):
+    for filename in sorted(os.listdir(migrations_dir)):
         if "github_connections" in filename.lower() and filename.endswith(".sql"):
             migration_file = os.path.join(migrations_dir, filename)
             break

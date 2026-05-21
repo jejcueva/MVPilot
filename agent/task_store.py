@@ -25,6 +25,24 @@ class ApprovalNotFoundError(KeyError):
     """Raised when a requested approval does not exist for a task."""
 
 
+def _snapshot_mvp_validation(state: Mapping[str, Any], current: dict[str, Any] | None) -> dict[str, Any] | None:
+    value = state.get("mvp_validation", current)
+    if isinstance(value, dict) and value.get("checks"):
+        return value
+    if isinstance(current, dict) and current.get("checks"):
+        return current
+    return None
+
+
+def _snapshot_mvp_delivery(state: Mapping[str, Any], current: dict[str, Any] | None) -> dict[str, Any] | None:
+    value = state.get("mvp_delivery", current)
+    if isinstance(value, dict) and "validation_passed" in value:
+        return value
+    if isinstance(current, dict) and "validation_passed" in current:
+        return current
+    return None
+
+
 class InMemoryTaskStore:
     def __init__(self) -> None:
         self._lock = asyncio.Lock()
@@ -62,6 +80,9 @@ class InMemoryTaskStore:
             additional_files=additional_files,
             github_connected=request.github_connected,
             github_connection_id=request.github_connection_id,
+            target_users=request.target_users,
+            tech_stack_preference=request.tech_stack_preference,
+            required_features=list(request.required_features),
             status=TaskStatus.STARTED,
             created_at=now,
             updated_at=now,
@@ -129,6 +150,10 @@ class InMemoryTaskStore:
                     state.get("generated_artifacts", current.generated_artifacts)
                 ),
                 graph_trace=list(state.get("graph_trace", current.graph_trace)),
+                mvp_plan=state.get("mvp_plan", current.mvp_plan),
+                build_timeline=list(state.get("build_timeline", current.build_timeline)),
+                mvp_validation=_snapshot_mvp_validation(state, current.mvp_validation),
+                mvp_delivery=_snapshot_mvp_delivery(state, current.mvp_delivery),
                 final_report=state.get("final_report", current.final_report),
             )
             self._tasks = {**self._tasks, task_id: updated_detail}

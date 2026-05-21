@@ -12,6 +12,7 @@ from agent.github_oauth import (
     SupabaseGitHubConnectionStore,
 )
 from agent.service import AgentService
+from agent.project_session_store import SupabasePersistingTaskStore, build_task_store
 from agent.task_store import InMemoryTaskStore
 
 
@@ -35,6 +36,7 @@ def reload_runtime_settings(request: Request) -> Settings:
     request.app.state.settings = fresh_settings
     request.app.state.github_connection_store = store
     request.app.state.github_connection_service = github_service
+    request.app.state.task_store = build_task_store(fresh_settings)
     request.app.state.agent_service = AgentService(
         request.app.state.task_store,
         fresh_settings,
@@ -47,7 +49,7 @@ def get_settings(request: Request) -> Settings:
     return request.app.state.settings
 
 
-def get_task_store(request: Request) -> InMemoryTaskStore:
+def get_task_store(request: Request) -> InMemoryTaskStore | SupabasePersistingTaskStore:
     return request.app.state.task_store
 
 

@@ -11,6 +11,13 @@ def test_health_returns_mock_defaults_without_secret_values(monkeypatch):
         "OPENCLAW_API_KEY",
         "GITHUB_TOKEN",
         "GITHUB_OWNER",
+        "GITHUB_OAUTH_CLIENT_ID",
+        "GITHUB_OAUTH_CLIENT_SECRET",
+        "GITHUB_OAUTH_REDIRECT_URI",
+        "GITHUB_CLIENT_ID",
+        "GITHUB_CLIENT_SECRET",
+        "GITHUB_REDIRECT_URI",
+        "GITHUB_TOKEN_ENCRYPTION_KEY",
     ):
         monkeypatch.delenv(key, raising=False)
     app = create_app(settings=Settings(_env_file=None, adapter_mode="mock"))
@@ -20,30 +27,31 @@ def test_health_returns_mock_defaults_without_secret_values(monkeypatch):
 
     assert response.status_code == 200
     data = response.json()
-    assert data == {
-        "status": "ok",
-        "adapter_mode": "mock",
-        "mock_mode": True,
-        "nemotron_model": "nvidia/nemotron-3-super-120b-a12b",
-        "nemotron_fast_model": "nvidia/nvidia-nemotron-nano-9b-v2",
-        "nvidia_configured": False,
-        "openclaw_configured": False,
-        "openclaw_env": None,
-        "openclaw_runtime_ready": False,
-        "openclaw_registered_tools": [],
-        "supabase_configured": False,
-        "rag_configured": False,
-        "rag_missing_env": [
-            "NVIDIA_API_KEY",
-            "SUPABASE_URL",
-            "SUPABASE_SERVICE_ROLE_KEY",
-        ],
-        "rag_live_ready": False,
-        "github_oauth_configured": False,
-        "github_pat_configured": False,
-        "github_oauth_redirect_uri": "http://127.0.0.1:3001/api/auth/github/callback",
-        "service": "mvpilot-agent",
-    }
+    assert data["status"] == "ok"
+    assert data["adapter_mode"] == "mock"
+    assert data["mock_mode"] is True
+    assert data["nemotron_model"] == "nvidia/nemotron-3-super-120b-a12b"
+    assert data["nemotron_fast_model"] == "nvidia/nvidia-nemotron-nano-9b-v2"
+    assert data["nvidia_configured"] is False
+    assert data["openclaw_configured"] is False
+    assert data["openclaw_env"] is None
+    assert data["openclaw_runtime_ready"] is False
+    assert data["openclaw_registered_tools"] == []
+    assert data["supabase_configured"] is False
+    assert data["rag_configured"] is False
+    assert data["rag_missing_env"] == [
+        "NVIDIA_API_KEY",
+        "SUPABASE_URL",
+        "SUPABASE_SERVICE_ROLE_KEY",
+    ]
+    assert data["rag_live_ready"] is False
+    assert data["github_oauth_configured"] is False
+    assert data["github_pat_configured"] is False
+    assert data["github_oauth_redirect_uri"] == (
+        "http://127.0.0.1:3001/api/auth/github/callback"
+    )
+    assert data["service"] == "mvpilot-agent"
+    assert data["require_live_file_manifest"] is True
     assert "fake-nvidia" not in response.text
     assert "fake-openclaw" not in response.text
 
